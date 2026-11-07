@@ -21,11 +21,13 @@
 from __future__ import annotations
 
 import argparse
+import base64
 import os
 import pathlib
 import re
 import socket
 import sys
+import tempfile
 import time
 import traceback
 
@@ -223,6 +225,12 @@ def run(verbose: bool = False) -> int:
 
     t = Runner(verbose)
 
+    # assets 用例用临时目录，避免依赖真实服务器路径
+    assets_dir = pathlib.Path(tempfile.mkdtemp(prefix="tdob_assets_"))
+    (assets_dir / "hello.txt").write_bytes(b"hello-assets")
+    (assets_dir / "sub").mkdir()
+    (assets_dir / "sub" / "a.bin").write_bytes(b"A" * 5000)
+
     cfg = dataclasses.replace(
         config.load_config(),
         db_backend="memory",
@@ -231,8 +239,14 @@ def run(verbose: bool = False) -> int:
         autosave_interval=3600,
         grace_seconds=2,      # 宽限期缩到 2s，超时销毁的用例才能跑得快
         device_id_secret="",  # 内存后端允许临时密钥
+        assets_dir=str(assets_dir),
+        asset_chunk_bytes=4096,
     )
     service = main_mod.Service(cfg)
+    # 战斗 / 生死流程默认要等 5s + 30min，测试里压缩成秒级
+    game.ATTACK_COOLDOWN = 0.05
+    game.DYING_SECONDS = 1.0
+    game.SPECTATOR_SECONDS = 2.0
     # 四阶段启动（与 python main.py serve 完全同一条路径）
     service.s1_init()
     service.s2_warmup()
@@ -255,7 +269,8 @@ def run(verbose: bool = False) -> int:
             t.eq(r.data.get("push_hz"), 0, "push_hz 应为 0（无主动推送）")
             actions = r.data.get("actions") or []
             for wanted in ("device", "check_name", "register", "login", "logout",
-                           "state", "peers", "world", "item"):
+                           "state", "peers", "world", "item",
+                           "races", "attack", "revive", "assets"):
                 t.check(wanted in actions, f"动作表包含 {wanted}")
         r = b.hello()
         t.check(a.token != b.token, "两条连接的 token 应不同")
@@ -478,6 +493,83 @@ def run(verbose: bool = False) -> int:
             t.eq(r.code, protocol.E_BAD_USER_ID, "错误码")
 
         # ------------------------------------------------------------------
+        t.case("races 由服务端下发（开发阶段仅人类）")
+        r = a.call("races", "")
+        t.check(r is not None and r.ok, "races 应 OK")
+        if r is not None and r.ok:
+            races = r.data.get("races") or []
+            t.eq(len(races), 1, "可用种族数")
+            if races:
+                t.eq(races[0].get("key"), "human", "默认种族 key")
+                t.eq(races[0].get("dev_only"), True, "开发阶段标记")
+
+        t.case("assets 分块下载与路径穿越防护")
+        r = a.call("assets", "list&")
+        t.check(r is not None and r.ok, f"list 应 OK got={r}")
+        names = {e.get("name") for e in ((r.data or {}).get("entries") or [])} if r else set()
+        t.check({"hello.txt", "sub"} <= names, f"列目录 names={names}")
+        r = a.call("assets", "get&hello.txt")
+        t.check(r is not None and r.ok, "get 应 OK")
+        if r is not None and r.ok:
+            t.eq(base64.b64decode(r.data.get("data", "")), b"hello-assets", "文件内容一致")
+            t.eq(r.data.get("eof"), True, "小文件一次读完")
+        r = a.call("assets", "get&sub/a.bin&0&8192")
+        t.check(r is not None and r.ok, "大文件分块 get 应 OK")
+        if r is not None and r.ok:
+            t.eq(r.data.get("length"), 4096, "单块被夹到 chunk_bytes")
+            t.eq(r.data.get("next_offset"), 4096, "next_offset")
+            t.eq(r.data.get("eof"), False, "尚未读完")
+        r = a.call("assets", "get&../secret.txt")
+        t.check(r is not None and not r.ok, "路径穿越必须被拒绝")
+
+        t.case("攻击 → 濒死 → 复活（5 秒窗口内救回）")
+        a.call("state", "0&0&0&0")
+        b.call("state", "0&0&0&0")
+        with game.mutate():
+            brow = game.players[b.user_id]
+            brow["spirit"] = 4.0
+            brow["rev"] = int(brow.get("rev", 0)) + 1
+        for _ in range(4):
+            r = a.call("attack", b.user_id)
+            t.check(r is not None and r.ok, "攻击应 OK")
+            time.sleep(0.08)
+        r = b.call("state", "0&0&0&0")
+        t.check(r is not None and r.ok, "濒死者仍可上报（坐标被冻结）")
+        if r is not None and r.ok:
+            t.eq(r.data.get("hp"), 0.0, "HP 归零")
+            t.eq(r.data.get("dying"), True, "进入濒死")
+        r = a.call("revive", b.user_id)
+        t.check(r is not None and r.ok, f"5 秒内复活应成功 got={r}")
+        if r is not None and r.ok:
+            t.eq(r.data.get("hp"), 30.0, "复活后回到 30% 生命")
+        r = b.call("state", "0&0&0&0")
+        t.check(r is not None and r.ok and r.data.get("dying") is False, "濒死状态已解除")
+
+        t.case("濒死不救 → 确认死亡 → 灵力转移 → 旁观 → 清空复活")
+        for _ in range(4):
+            a.call("attack", b.user_id)
+            time.sleep(0.08)
+        time.sleep(game.DYING_SECONDS + 1.2)       # 等计时线程确认死亡
+        r = a.call("peers")
+        ids = {p.get("user_id") for p in ((r.data or {}).get("players") or [])} if r else set()
+        t.check(b.user_id not in ids, f"旁观者不进入 peers ids={ids}")
+        arow = game.get_player(a.user_id) or {}
+        t.eq(arow.get("kills"), 1, "击杀数 +1")
+        t.eq(arow.get("level"), 2, "灵力 2 触发升级（本级消耗 2）")
+        t.eq(arow.get("spirit"), 0.0, "升级消耗后灵力归零")
+        brow = game.get_player(b.user_id) or {}
+        t.check(brow.get("spectator_until") is not None, "进入 30 分钟旁观（测试压缩）")
+        t.eq(brow.get("deaths"), 1, "死亡数 +1")
+
+        time.sleep(game.SPECTATOR_SECONDS + 1.2)   # 等旁观结束
+        r = a.call("peers")
+        ids = {p.get("user_id") for p in ((r.data or {}).get("players") or [])} if r else set()
+        t.check(b.user_id in ids, f"旁观结束回到世界 ids={ids}")
+        brow = game.get_player(b.user_id) or {}
+        t.eq(brow.get("spirit"), 0.0, "灵力已清空")
+        t.eq(brow.get("inventory"), {}, "背包已清空")
+        t.eq(brow.get("hp"), 100.0, "满血复活")
+
         t.case("logout 完整拆除（流程 3）")
         b_user = b.user_id
         r = b.call("logout")

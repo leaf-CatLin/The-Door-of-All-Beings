@@ -41,6 +41,14 @@ players 元素结构（对应表 player）
   "hp_max": 100.0, "hp": 88.0,
   "stamina_max": 100.0, "stamina": 100.0,
   "mana_max": 100.0, "mana": 100.0,
+  "spirit": 4.0,          # 灵力（每小时 +1，升级消耗）
+  "level": 2,             # 等级
+  "spirit_at": 1761379200.0,  # 上次保存时间（每小时累计的基准点）
+  "death_at": None,       # 濒死开始时间（5 秒内可被复活）
+  "spectator_until": None,# 旁观结束时间（死亡 30 分钟）
+  "last_attacker": "",    # 最后一次伤害来源（死亡结算赏金）
+  "inventory": {},        # 背包
+  "kills": 0, "deaths": 0,
   "rev": 7,
   "updated_at": 1761379200.0,
 }
@@ -87,6 +95,35 @@ DEFAULT_STATS = {
     "mana_max": 100.0,
     "mana": 100.0,
 }
+
+# ---------------------------------------------------------------------------
+# 灵力 / 等级
+# ---------------------------------------------------------------------------
+## 每小时固定增长的灵力
+SPIRIT_PER_HOUR = 1.0
+SPIRIT_HOUR_SECONDS = 3600.0
+## 等级上限（防御性：避免异常数据把升级循环卡死）
+MAX_LEVEL = 9999
+
+# ---------------------------------------------------------------------------
+# 战斗 / 死亡
+# ---------------------------------------------------------------------------
+## 近战：射程 / 单次伤害 / 攻击冷却（秒）
+ATTACK_RANGE = 3.0
+ATTACK_DAMAGE = 25.0
+ATTACK_COOLDOWN = 0.8
+## 濒死后被复活类治疗的最大距离
+REVIVE_RANGE = 5.0
+## 复活后恢复到生命上限的百分比
+REVIVE_HP_RATIO = 0.3
+## 倒地后没有治疗则判定死亡的窗口（秒）
+DYING_SECONDS = 5.0
+## 死亡后旁观时长（秒）；到期清空灵力与背包并原地复活
+SPECTATOR_SECONDS = 1800.0
+## 击杀灵力转移比例：受害者等级 > 击杀者 75%；同级 50%；更低 25%
+KILL_SPIRIT_RATIO_HIGHER = 0.75
+KILL_SPIRIT_RATIO_EQUAL = 0.5
+KILL_SPIRIT_RATIO_LOWER = 0.25
 
 
 # ---------------------------------------------------------------------------
@@ -138,6 +175,145 @@ def _apply_stat(row: dict, key: str, value) -> None:
         return
     cap = _num(row.get(f"{key}_max"), 100.0)
     row[key] = max(0.0, min(cap, raw))
+
+
+# ---------------------------------------------------------------------------
+# 灵力 / 等级 / 生死流转
+# ---------------------------------------------------------------------------
+
+def level_cost(level: int) -> int:
+    """从 ``level`` 升到 ``level + 1`` 需要消耗的灵力。
+
+    需求：1 级需要 1 灵力，2 级在一级基础上 +2，3 级再 +3（累加 1/3/6/10…）。
+    这里返回“当前等级 -> 下一级”的增量，即 level + 1。
+    """
+    return int(level) + 1
+
+
+def total_spirit_for_level(level: int) -> int:
+    """达到 ``level`` 级累计需要获得的灵力（1 / 3 / 6 / 10 …）。"""
+    level = max(0, int(level))
+    return level * (level + 1) // 2
+
+
+def _apply_levels(row: dict) -> bool:
+    """按“升级消耗灵力”自动升级；返回是否发生了升级。"""
+    changed = False
+    while True:
+        level = int(row.get("level", 1) or 1)
+        if level >= MAX_LEVEL:
+            break
+        cost = level_cost(level)
+        if _num(row.get("spirit")) < cost:
+            break
+        row["spirit"] = _num(row.get("spirit")) - cost
+        row["level"] = level + 1
+        changed = True
+    return changed
+
+
+def _tick_spirit(row: dict, now: float) -> bool:
+    """懒结算灵力：每小时 +1（离线时间同样计入）。调用方必须持锁。"""
+    at = _num(row.get("spirit_at"))
+    if at <= 0 or at > now:
+        # 未结算过 / 时间被倒拨：以当前时刻作为起点，不发放异常收益
+        row["spirit_at"] = now
+        return False
+    hours = int((now - at) // SPIRIT_HOUR_SECONDS)
+    if hours <= 0:
+        return False
+    row["spirit_at"] = at + hours * SPIRIT_HOUR_SECONDS
+    row["spirit"] = _num(row.get("spirit")) + hours * SPIRIT_PER_HOUR
+    _apply_levels(row)
+    return True
+
+
+def _is_spectating(row: dict, now: float) -> bool:
+    until = row.get("spectator_until")
+    return until is not None and _num(until) > now
+
+
+def _is_dying(row: dict) -> bool:
+    return row.get("death_at") is not None
+
+
+def _kill_ratio(killer_level: int, victim_level: int) -> float:
+    """击杀灵力转移比例：击杀高等级者 75%，同级 50%，低等级者 25%。"""
+    if victim_level > killer_level:
+        return KILL_SPIRIT_RATIO_HIGHER
+    if victim_level == killer_level:
+        return KILL_SPIRIT_RATIO_EQUAL
+    return KILL_SPIRIT_RATIO_LOWER
+
+
+def _resolve_timers(row: dict, now: float) -> list[str]:
+    """推进一名玩家的濒死 / 旁观计时器；返回发生的事件名列表。
+
+    调用方必须持锁。可能的返回值：
+      ``died``      —— 5 秒窗口到期，确认死亡并进入 30 分钟旁观
+      ``respawned`` —— 旁观结束，灵力 / 背包清空、满血原地复活
+    """
+    events: list[str] = []
+
+    death_at = row.get("death_at")
+    if death_at is not None and now - _num(death_at) >= DYING_SECONDS:
+        row["death_at"] = None
+        row["deaths"] = int(row.get("deaths") or 0) + 1
+        row["spectator_until"] = now + SPECTATOR_SECONDS
+        row["hp"] = 0.0
+        row["state"] = "dead"
+        _transfer_kill_spirit(row, now)
+        events.append("died")
+
+    until = row.get("spectator_until")
+    if until is not None and now >= _num(until):
+        row["spectator_until"] = None
+        row["death_at"] = None
+        row["spirit"] = 0.0
+        row["inventory"] = {}
+        row["hp"] = _num(row.get("hp_max"), 100.0)
+        row["state"] = "idle"
+        row["last_attacker"] = ""
+        row["rev"] = int(row.get("rev", 0)) + 1
+        row["updated_at"] = now
+        events.append("respawned")
+
+    return events
+
+
+def _transfer_kill_spirit(victim: dict, now: float) -> None:
+    """死亡结算：把受害者当前灵力的一部分转给最后攻击者。调用方必须持锁。"""
+    killer_id = str(victim.get("last_attacker") or "").strip()
+    victim["last_attacker"] = ""
+    if not killer_id or killer_id == victim.get("user_id"):
+        return
+    killer = players.get(killer_id)
+    if killer is None:
+        return
+
+    victim_level = int(victim.get("level", 1) or 1)
+    killer_level = int(killer.get("level", 1) or 1)
+    ratio = _kill_ratio(killer_level, victim_level)
+    killer["kills"] = int(killer.get("kills") or 0) + 1
+    killer["rev"] = int(killer.get("rev", 0)) + 1
+    killer["updated_at"] = now
+
+    amount = _num(victim.get("spirit")) * ratio
+    if amount <= 0:
+        return
+
+    victim["spirit"] = max(0.0, _num(victim.get("spirit")) - amount)
+    killer["spirit"] = _num(killer.get("spirit")) + amount
+    _apply_levels(killer)
+    victim["rev"] = int(victim.get("rev", 0)) + 1
+    victim["updated_at"] = now
+
+
+def _distance(a: dict, b: dict) -> float:
+    dx = _num(a.get("pos_x")) - _num(b.get("pos_x"))
+    dy = _num(a.get("pos_y")) - _num(b.get("pos_y"))
+    dz = _num(a.get("pos_z")) - _num(b.get("pos_z"))
+    return math.sqrt(dx * dx + dy * dy + dz * dz)
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +472,17 @@ def _new_player_row(
         "updated_at": time.time(),
     }
     row.update(DEFAULT_STATS)
+    row.update({
+        "spirit": 0.0,
+        "level": 1,
+        "spirit_at": time.time(),
+        "death_at": None,
+        "spectator_until": None,
+        "last_attacker": "",
+        "inventory": {},
+        "kills": 0,
+        "deaths": 0,
+    })
     return row
 
 
@@ -324,19 +511,24 @@ def set_player_state(
         if row is None:
             row = _new_player_row(user_id, user_name, device_id_hex)
             players[user_id] = row
-        row["pos_x"], row["pos_y"], row["pos_z"] = pos[0], pos[1], pos[2]
-        row["yaw"] = _norm_yaw(yaw)
+        now = time.time()
+        _tick_spirit(row, now)
+        _resolve_timers(row, now)
         if user_name:
             row["user_name"] = user_name
         if device_id_hex:
             row["device_id"] = device_id_hex
-        row["state"] = state if state in PLAYER_STATES else "idle"
-        _apply_stat(row, "hp", hp)
-        _apply_stat(row, "stamina", stamina)
-        _apply_stat(row, "mana", mana)
+        # 濒死 / 旁观期间坐标与状态由服务端冻结：客户端上报的飞行坐标不落库，
+        # 死亡点就是复活点（旁观结束后原地满血复活）。
+        if not _is_dying(row) and not _is_spectating(row, now):
+            row["pos_x"], row["pos_y"], row["pos_z"] = pos[0], pos[1], pos[2]
+            row["yaw"] = _norm_yaw(yaw)
+            row["state"] = state if state in PLAYER_STATES else "idle"
+            _apply_stat(row, "stamina", stamina)
+            _apply_stat(row, "mana", mana)
         row["online"] = True
         row["rev"] = int(row.get("rev", 0)) + 1
-        row["updated_at"] = time.time()
+        row["updated_at"] = now
         result = dict(row)
     bump_players_rev()
     return result
@@ -381,6 +573,17 @@ def _normalize_player_row(row: dict) -> dict | None:
         "stamina": _num(row.get("stamina"), 100.0),
         "mana_max": _num(row.get("mana_max"), 100.0),
         "mana": _num(row.get("mana"), 100.0),
+        "spirit": _num(row.get("spirit")),
+        "level": int(row.get("level") or 1),
+        "spirit_at": _num(row.get("spirit_at")),
+        "death_at": _num(row.get("death_at")) if row.get("death_at") is not None else None,
+        "spectator_until": (
+            _num(row.get("spectator_until")) if row.get("spectator_until") is not None else None
+        ),
+        "last_attacker": str(row.get("last_attacker") or ""),
+        "inventory": row.get("inventory") if isinstance(row.get("inventory"), dict) else {},
+        "kills": int(row.get("kills") or 0),
+        "deaths": int(row.get("deaths") or 0),
         "rev": int(row.get("rev") or 0),
         "updated_at": _num(row.get("updated_at"), time.time()),
     }
@@ -440,6 +643,10 @@ def enter_world(
             row["player_id"] = player_id
         if file_hash and not row.get("file_hash"):
             row["file_hash"] = file_hash
+        # 离线期间攒的灵力在这里补结算；濒死 / 旁观计时器也一并推进
+        now = time.time()
+        _tick_spirit(row, now)
+        _resolve_timers(row, now)
         row["online"] = True
         row["rev"] = int(row.get("rev", 0)) + 1
         row["updated_at"] = time.time()
@@ -482,6 +689,8 @@ def destroy_player(user_id: str) -> bool:
 
 
 def players_payload(include_offline: bool = False) -> list[dict]:
+    """在线玩家快照。旁观者（无实体）不入列表，濒死者仍在列表里（state=dead）。"""
+    now = time.time()
     with _lock:
         return [
             {
@@ -489,6 +698,7 @@ def players_payload(include_offline: bool = False) -> list[dict]:
                 "user_name": p.get("user_name", ""),
                 "player_name": p.get("player_name", "") or p.get("user_name", ""),
                 "race": p.get("race", DEFAULT_RACE),
+                "level": int(p.get("level", 1) or 1),
                 "pos_x": p.get("pos_x", 0.0),
                 "pos_y": p.get("pos_y", 0.0),
                 "pos_z": p.get("pos_z", 0.0),
@@ -500,10 +710,230 @@ def players_payload(include_offline: bool = False) -> list[dict]:
                 "stamina": p.get("stamina", 100.0),
                 "mana_max": p.get("mana_max", 100.0),
                 "mana": p.get("mana", 100.0),
+                "dying": _is_dying(p),
             }
             for p in players.values()
-            if include_offline or p.get("online", False)
+            if (include_offline or p.get("online", False)) and not _is_spectating(p, now)
         ]
+
+
+def self_payload(user_id: str) -> dict | None:
+    """自己的权威状态（state 动作的返回值，客户端据此刷新 HP / 灵力 / 等级 / 生死）。"""
+    now = time.time()
+    with _lock:
+        row = players.get(user_id)
+        if row is None:
+            return None
+        _tick_spirit(row, now)
+        _resolve_timers(row, now)
+        dying_remaining = 0.0
+        if _is_dying(row):
+            dying_remaining = max(0.0, DYING_SECONDS - (now - _num(row.get("death_at"))))
+        spectator_remaining = 0.0
+        if _is_spectating(row, now):
+            spectator_remaining = max(0.0, _num(row.get("spectator_until")) - now)
+        return {
+            "user_id": row["user_id"],
+            "player_name": row.get("player_name", "") or row.get("user_name", ""),
+            "hp": _num(row.get("hp")),
+            "hp_max": _num(row.get("hp_max"), 100.0),
+            "spirit": _num(row.get("spirit")),
+            "level": int(row.get("level", 1) or 1),
+            "kills": int(row.get("kills") or 0),
+            "deaths": int(row.get("deaths") or 0),
+            "dying": _is_dying(row),
+            "dying_remaining": dying_remaining,
+            "spectating": _is_spectating(row, now),
+            "spectator_remaining": spectator_remaining,
+            "pos_x": _num(row.get("pos_x")),
+            "pos_y": _num(row.get("pos_y")),
+            "pos_z": _num(row.get("pos_z")),
+            "yaw": _norm_yaw(row.get("yaw")),
+        }
+
+
+def attack(attacker_id: str, target_id: str, now: float | None = None) -> dict:
+    """近战攻击：射程 / 冷却 / 目标校验全部在服务端做。
+
+    返回 ``{"ok": True, ...}`` 或 ``{"ok": False, "error": "<原因>"}``。
+    命中使目标 HP 归零时进入濒死（5 秒内可被 revive 救回）。
+    """
+    now = time.time() if now is None else now
+    if not target_id:
+        return {"ok": False, "error": "缺少目标"}
+    if target_id == attacker_id:
+        return {"ok": False, "error": "不能攻击自己"}
+
+    with mutate():
+        attacker = players.get(attacker_id)
+        target = players.get(target_id)
+        if attacker is None or not attacker.get("online"):
+            return {"ok": False, "error": "攻击者不在线"}
+        if target is None or not target.get("online"):
+            return {"ok": False, "error": "目标不在线"}
+
+        _tick_spirit(attacker, now)
+        _resolve_timers(attacker, now)
+        _tick_spirit(target, now)
+        _resolve_timers(target, now)
+
+        if _is_spectating(attacker, now) or _is_dying(attacker):
+            return {"ok": False, "error": "濒死或旁观时无法攻击"}
+        if _is_spectating(target, now):
+            return {"ok": False, "error": "目标处于旁观状态"}
+
+        last = _num(attacker.get("attack_at"))
+        if now - last < ATTACK_COOLDOWN:
+            return {"ok": False, "error": "攻击冷却中", "cooldown": ATTACK_COOLDOWN - (now - last)}
+
+        dist = _distance(attacker, target)
+        if dist > ATTACK_RANGE:
+            return {"ok": False, "error": "目标超出射程", "distance": round(dist, 2)}
+
+        attacker["attack_at"] = now
+        attacker["yaw"] = _yaw_towards(attacker, target)
+        attacker["rev"] = int(attacker.get("rev", 0)) + 1
+        attacker["updated_at"] = now
+        if _is_dying(target):
+            return {"ok": False, "error": "目标已濒死"}
+
+        target["hp"] = max(0.0, _num(target.get("hp"), 100.0) - ATTACK_DAMAGE)
+        target["last_attacker"] = attacker_id
+        target["rev"] = int(target.get("rev", 0)) + 1
+        target["updated_at"] = now
+        if target["hp"] <= 0.0:
+            target["hp"] = 0.0
+            target["death_at"] = now
+            target["state"] = "dead"
+
+        result = {
+            "ok": True,
+            "target": target_id,
+            "damage": ATTACK_DAMAGE,
+            "hp": target["hp"],
+            "hp_max": _num(target.get("hp_max"), 100.0),
+            "dying": _is_dying(target),
+            "dying_remaining": DYING_SECONDS if _is_dying(target) else 0.0,
+            "distance": round(dist, 2),
+            "attack_at": now,
+        }
+    bump_players_rev()
+    return result
+
+
+def revive(healer_id: str, target_id: str, now: float | None = None) -> dict:
+    """复活类治疗：把 5 秒濒死窗口里的玩家拉起来。"""
+    now = time.time() if now is None else now
+    if not target_id:
+        return {"ok": False, "error": "缺少目标"}
+    if target_id == healer_id:
+        return {"ok": False, "error": "不能治疗自己"}
+
+    with mutate():
+        healer = players.get(healer_id)
+        target = players.get(target_id)
+        if healer is None or not healer.get("online"):
+            return {"ok": False, "error": "治疗者不在线"}
+        if target is None or not target.get("online"):
+            return {"ok": False, "error": "目标不在线"}
+
+        _resolve_timers(healer, now)
+        _resolve_timers(target, now)
+        if _is_spectating(healer, now) or _is_dying(healer):
+            return {"ok": False, "error": "濒死或旁观时无法治疗"}
+        if not _is_dying(target):
+            return {"ok": False, "error": "目标没有处于濒死"}
+
+        dist = _distance(healer, target)
+        if dist > REVIVE_RANGE:
+            return {"ok": False, "error": "目标超出治疗距离", "distance": round(dist, 2)}
+
+        target["death_at"] = None
+        target["last_attacker"] = ""
+        target["hp"] = max(1.0, _num(target.get("hp_max"), 100.0) * REVIVE_HP_RATIO)
+        target["state"] = "idle"
+        target["rev"] = int(target.get("rev", 0)) + 1
+        target["updated_at"] = now
+        healer["rev"] = int(healer.get("rev", 0)) + 1
+        healer["updated_at"] = now
+
+        result = {
+            "ok": True,
+            "target": target_id,
+            "hp": target["hp"],
+            "hp_max": _num(target.get("hp_max"), 100.0),
+            "distance": round(dist, 2),
+        }
+    bump_players_rev()
+    return result
+
+
+def _yaw_towards(src: dict, dst: dict) -> float:
+    dx = _num(dst.get("pos_x")) - _num(src.get("pos_x"))
+    dz = _num(dst.get("pos_z")) - _num(src.get("pos_z"))
+    return _norm_yaw(math.degrees(math.atan2(dx, -dz)))
+
+
+def settle_all(now: float | None = None) -> int:
+    """推进所有缓存玩家的计时器（灵力小时结算 / 濒死 / 旁观到期）。
+
+    返回发生状态变化的玩家数。后台线程每秒调一次；离线玩家也覆盖
+    （他们仍在缓存里时，灵力与计时器要照常走）。
+    """
+    now = time.time() if now is None else now
+    changed: dict[str, int] = {}
+    with mutate():
+        for uid, row in players.items():
+            before = (row.get("spirit"), row.get("level"), row.get("death_at"),
+                      row.get("spectator_until"), row.get("hp"))
+            spirit_changed = _tick_spirit(row, now)
+            _resolve_timers(row, now)
+            after = (row.get("spirit"), row.get("level"), row.get("death_at"),
+                     row.get("spectator_until"), row.get("hp"))
+            if spirit_changed or before != after:
+                row["rev"] = int(row.get("rev", 0)) + 1
+                row["updated_at"] = now
+                changed[uid] = int(row.get("rev", 0))
+    if changed:
+        bump_players_rev()
+    return len(changed)
+
+
+def _timers_loop(interval: float, stop_event: threading.Event) -> None:
+    while not stop_event.wait(max(0.05, interval)):
+        try:
+            settle_all()
+        except Exception:  # pragma: no cover - 后台线程不允许因单次异常退出
+            log.exception("结算线程异常")
+
+
+_timers_stop: threading.Event | None = None
+_timers_thread: threading.Thread | None = None
+
+
+def start_timers(interval: float = 1.0) -> None:
+    """启动后台结算线程（灵力 / 濒死 / 旁观）。重复调用是安全的。"""
+    global _timers_stop, _timers_thread
+    if _timers_thread is not None and _timers_thread.is_alive():
+        return
+    _timers_stop = threading.Event()
+    _timers_thread = threading.Thread(
+        target=_timers_loop, args=(interval, _timers_stop),
+        name="game-timers", daemon=True,
+    )
+    _timers_thread.start()
+    log.info("计时线程已启动：灵力每小时 +%s，濒死 %.0fs，旁观 %.0fs",
+             SPIRIT_PER_HOUR, DYING_SECONDS, SPECTATOR_SECONDS)
+
+
+def stop_timers() -> None:
+    global _timers_stop, _timers_thread
+    if _timers_stop is not None:
+        _timers_stop.set()
+    if _timers_thread is not None:
+        _timers_thread.join(timeout=2.0)
+    _timers_stop = None
+    _timers_thread = None
 
 
 def online_count() -> int:

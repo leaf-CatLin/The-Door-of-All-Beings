@@ -24,6 +24,8 @@ MAX_CONNECTIONS                   最大并发连接数（默认 256）
 AUTOSAVE_INTERVAL                 内存数据落库间隔秒数（默认 60）
 USER_NAME_MAX_LEN                 用户名称最大长度（默认 24）
 GRACE_SECONDS                     意外断开后的宽限期秒数（默认 5）
+ASSETS_DIR                        服务器资源根目录（默认 /home/mimi/obj/assets/The-Doors-of-Bings）
+ASSET_CHUNK_BYTES                 assets 分块下载的单块字节数（默认 8192）
 ==================================  ===========================================
 
 注意：`HOST` 只用于日志展示与调试直连，不再参与「是否启动 TCP」的判断
@@ -42,6 +44,9 @@ from dotenv import load_dotenv
 PROTOCOL_VERSION = "1.3"
 ## 服务端软件版本：随发布递增，客户端可据此提示更新
 SERVICE_VERSION = "4.0.0"
+
+## 服务器资源目录默认值（POSIX 路径；本地 Windows 创建失败只告警）
+ASSETS_DIR_DEFAULT = "/home/mimi/obj/assets/The-Doors-of-Bings"
 
 ## 工程根目录（本文件所在目录），用于定位 .env / schema.sql
 BASE_DIR = Path(__file__).resolve().parent
@@ -99,6 +104,8 @@ class Config:
     autosave_interval: int
     user_name_max_len: int
     grace_seconds: int
+    assets_dir: str
+    asset_chunk_bytes: int
 
     @property
     def storage_is_memory(self) -> bool:
@@ -110,7 +117,7 @@ class Config:
             f"service={SERVICE_VERSION} protocol={PROTOCOL_VERSION} "
             f"tcp={self.tcp_bind}:{self.tcp_port} "
             f"public={self.public_host}:{self.public_port} "
-            f"db={self.db_backend} push=off(pull)"
+            f"db={self.db_backend} push=off(pull) assets={self.assets_dir}"
         )
 
 
@@ -143,6 +150,8 @@ def load_config(env_path: Path | None = None) -> Config:
         autosave_interval=_env_int("AUTOSAVE_INTERVAL", 60),
         user_name_max_len=_env_int("USER_NAME_MAX_LEN", 24),
         grace_seconds=_env_int("GRACE_SECONDS", 5),
+        assets_dir=_env_str("ASSETS_DIR", ASSETS_DIR_DEFAULT) or ASSETS_DIR_DEFAULT,
+        asset_chunk_bytes=max(512, _env_int("ASSET_CHUNK_BYTES", 8192)),
     )
 
 
@@ -158,7 +167,7 @@ ENV_KEYS = (
     "DEVICE_ID_MAX_AGE", "REQUEST_TIME_WINDOW",
     "MAX_LINE_BYTES", "READ_TIMEOUT", "MAX_CONNECTIONS",
     "AUTOSAVE_INTERVAL", "USER_NAME_MAX_LEN",
-    "GRACE_SECONDS",
+    "GRACE_SECONDS", "ASSETS_DIR", "ASSET_CHUNK_BYTES",
 )
 
 
@@ -193,6 +202,8 @@ def export_env(cfg: Config) -> list[str]:
         "AUTOSAVE_INTERVAL": str(cfg.autosave_interval),
         "USER_NAME_MAX_LEN": str(cfg.user_name_max_len),
         "GRACE_SECONDS": str(cfg.grace_seconds),
+        "ASSETS_DIR": cfg.assets_dir,
+        "ASSET_CHUNK_BYTES": str(cfg.asset_chunk_bytes),
     }
     written: list[str] = []
     for key in ENV_KEYS:

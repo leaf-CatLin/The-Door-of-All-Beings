@@ -435,3 +435,32 @@ S→C  OK | logout | {"authenticated":false,"saved":true,"user_id":"ZWME-2WKQ"}
    长时间不发上行时需要靠 `ping` 撑住 `READ_TIMEOUT`。
 6. **拉取频率由客户端把握**：没有服务端推送后，`peers` / `world` 的实时性取决于客户端轮询频率；
    轮询过密会加重服务端读放大，需要客户端做退避/合并（可用批量把 `state` + `peers` 塞进一条报文）。
+
+---
+
+## 10. 动作扩展（种族 / 战斗 / 资源）
+
+| action | payload | 鉴权 | OK data |
+|---|---|---|---|
+| `races` | 空 | 不需要 | `{"races": [{"key","name","dev_only"}]}` |
+| `attack` | `<target_user_id>` | 需要 | `{"ok","target","damage","hp","hp_max","dying","dying_remaining","distance"}` |
+| `revive` | `<target_user_id>` | 需要 | `{"ok","target","hp","hp_max","distance"}` |
+| `assets` | `<sub>&<path>[&<offset>][&<length>]` | 需要 | 见下 |
+
+* `races`：种族清单**由服务端裁定**，开发阶段只返回 `human`。`race.tscn` 据此渲染选项，
+  `register` 的 race 字段若不在清单里一律落回 `human`。
+* `attack`：服务端判定射程（3m）/ 冷却（0.8s）/ 目标状态，单次伤害 25；目标 HP 归零进入
+  **濒死**（`dying=true`，5 秒窗口），不是立刻死亡。
+* `revive`：治疗者需在 5m 内，把濒死目标拉起（恢复到 30% 生命），并清空击杀归属。
+* `assets` 子动作：
+  * `list&path` —— 列目录，返回 `entries`（name / is_dir / size / mtime）与 `chunk_bytes`；
+  * `stat&path` —— 返回 `exists` / `is_dir` / `size` / `mtime`；
+  * `get&path&offset&length` —— 分块读取，`length` 被服务端夹到 `chunk_bytes`（默认 8192），
+    返回 `data`（base64）/ `total` / `next_offset` / `eof`，客户端按 `next_offset` 续拉。
+  资源根目录由 `ASSETS_DIR` 指定（默认 `/home/mimi/obj/assets/The-Doors-of-Bings`），
+  路径穿越（`..`、绝对路径、盘符）一律拒绝。
+
+`state` 的 OK data 在 v1.3 扩展里追加了权威自身状态：
+`hp / hp_max / spirit / level / kills / deaths / dying / dying_remaining / spectating / spectator_remaining / pos_* / yaw`。
+客户端只读，不再用本地 HP 覆盖服务端。
+

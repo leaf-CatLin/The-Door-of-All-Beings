@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import threading
 import time
@@ -48,6 +49,8 @@ PLAYER_COLUMNS = (
     "user_id", "player_id", "file_hash", "player_name", "race",
     "pos_x", "pos_y", "pos_z", "yaw", "state", "online",
     "hp_max", "hp", "stamina_max", "stamina", "mana_max", "mana",
+    "spirit", "level", "spirit_at", "death_at", "spectator_until",
+    "last_attacker", "inventory", "kills", "deaths",
     "rev",
 )
 ## world_item 表参与落库的字段
@@ -114,6 +117,24 @@ def _bool(value: Any, default: bool = False) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes", "on", "t")
 
 
+def _json_obj(value: Any) -> dict:
+    """归一 JSON 对象字段（psycopg2 读回时已经是 dict）。"""
+    if isinstance(value, dict):
+        return value
+    if isinstance(value, (str, bytes)):
+        try:
+            parsed = json.loads(value)
+        except (TypeError, ValueError):
+            return {}
+        return parsed if isinstance(parsed, dict) else {}
+    return {}
+
+
+def _json_text(value: Any) -> str:
+    """给 jsonb 列用的参数：始终是合法 JSON 文本。"""
+    return json.dumps(_json_obj(value), ensure_ascii=False, sort_keys=True)
+
+
 def player_params(row: dict) -> tuple:
     """把内存里的 player 行整理成 INSERT 参数（顺序 = PLAYER_COLUMNS）。"""
     return (
@@ -134,6 +155,15 @@ def player_params(row: dict) -> tuple:
         _num(row.get("stamina"), 100.0),
         _num(row.get("mana_max"), 100.0),
         _num(row.get("mana"), 100.0),
+        _num(row.get("spirit")),
+        _int(row.get("level"), 1) or 1,
+        _num(row.get("spirit_at")),
+        _num(row.get("death_at")) if row.get("death_at") is not None else None,
+        _num(row.get("spectator_until")) if row.get("spectator_until") is not None else None,
+        _text(row.get("last_attacker")),
+        _json_text(row.get("inventory")),
+        _int(row.get("kills")),
+        _int(row.get("deaths")),
         _int(row.get("rev")),
     )
 
@@ -252,8 +282,15 @@ _SAVE_PLAYER_SQL = """
     INSERT INTO player (
         user_id, player_id, file_hash, player_name, race,
         pos_x, pos_y, pos_z, yaw, state, online,
-        hp_max, hp, stamina_max, stamina, mana_max, mana, rev, updated_at
-    ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, now())
+        hp_max, hp, stamina_max, stamina, mana_max, mana,
+        spirit, level, spirit_at, death_at, spectator_until,
+        last_attacker, inventory, kills, deaths, rev, updated_at
+    ) VALUES (
+        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+        %s, %s, %s, %s, %s, %s,
+        %s, %s, %s, %s, %s,
+        %s, %s, %s, %s, %s, now()
+    )
     ON CONFLICT (user_id) DO UPDATE SET
         player_id     = COALESCE(NULLIF(EXCLUDED.player_id, ''), player.player_id),
         file_hash     = COALESCE(NULLIF(EXCLUDED.file_hash, ''), player.file_hash),
@@ -271,6 +308,15 @@ _SAVE_PLAYER_SQL = """
         stamina       = EXCLUDED.stamina,
         mana_max      = EXCLUDED.mana_max,
         mana          = EXCLUDED.mana,
+        spirit        = EXCLUDED.spirit,
+        level         = EXCLUDED.level,
+        spirit_at     = EXCLUDED.spirit_at,
+        death_at      = EXCLUDED.death_at,
+        spectator_until = EXCLUDED.spectator_until,
+        last_attacker = EXCLUDED.last_attacker,
+        inventory     = EXCLUDED.inventory,
+        kills         = EXCLUDED.kills,
+        deaths        = EXCLUDED.deaths,
         rev           = EXCLUDED.rev,
         updated_at    = now()
     WHERE player.rev < EXCLUDED.rev

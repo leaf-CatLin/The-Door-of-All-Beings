@@ -181,6 +181,9 @@ def main() -> int:
             "hp_max": 120.0, "hp": 88.0,
             "stamina_max": 90.0, "stamina": 45.5,
             "mana_max": 200.0, "mana": 33.0,
+            "spirit": 7.5, "level": 3, "spirit_at": 1761379200.0,
+            "death_at": None, "spectator_until": None, "last_attacker": "",
+            "inventory": {"wood": 3}, "kills": 2, "deaths": 1,
             "rev": 1,
         }
         saved = store.save_players([player_row])
@@ -194,6 +197,12 @@ def main() -> int:
                   and abs(got["stamina"] - 45.5) < 1e-9 and abs(got["mana"] - 33.0) < 1e-9,
                   "三围与种族读回一致")
             check(got.get("user_name") == name_a, "JOIN 带回账号名")
+            check(abs(float(got.get("spirit") or 0) - 7.5) < 1e-9
+                  and int(got.get("level") or 0) == 3,
+                  "灵力 / 等级读回一致")
+            check(isinstance(got.get("inventory"), dict)
+                  and int(got["inventory"].get("wood", 0)) == 3,
+                  "JSONB 背包读回一致")
 
         stale_player = dict(player_row, hp=1.0, rev=0)
         res = store.save_players([stale_player])

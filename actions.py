@@ -12,10 +12,13 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import logging
+import os
 import time
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Callable
 
 import config
@@ -35,6 +38,13 @@ from protocol import (
 from session import Session
 
 log = logging.getLogger(__name__)
+
+## 服务端裁定的可用种族（开发阶段只有人类）。
+## 客户端 race.tscn 用 races 动作取这份清单，不再本地硬编码。
+RACES: tuple[dict, ...] = (
+    {"key": "human", "name": "人类", "dev_only": True},
+)
+RACE_KEYS = tuple(r["key"] for r in RACES)
 
 
 @dataclass
@@ -339,6 +349,9 @@ def handle_register(req, session, ctx) -> bytes:
     user_name = parts[0] if parts else ""
     race = parts[1] if len(parts) > 1 else ""
     player_id = parts[2] if len(parts) > 2 else ""
+    # 种族由服务端裁定：客户端选了不在可用列表里的种族，一律落回默认种族
+    if race not in RACE_KEYS:
+        race = game.DEFAULT_RACE
 
     ok_flag, code, info = ctx.users.register(
         user_name,
@@ -536,10 +549,27 @@ def handle_state(req, session, ctx) -> bytes:
     if row is None:
         return fail("state", E_BAD_PAYLOAD, "坐标非法")
     session.touch()
+    mine = game.self_payload(session.user_id) or {}
     return ok("state", {
         "t": int(row["updated_at"]),
         "seq": game.revisions()[1],
         "rev": int(row.get("rev", 0)),
+        # 权威状态：HP / 灵力 / 等级 / 濒死 / 旁观（客户端只读）
+        "hp": mine.get("hp", row.get("hp")),
+        "hp_max": mine.get("hp_max", row.get("hp_max")),
+        "spirit": mine.get("spirit", row.get("spirit")),
+        "level": mine.get("level", row.get("level")),
+        "kills": mine.get("kills", 0),
+        "deaths": mine.get("deaths", 0),
+        "dying": mine.get("dying", False),
+        "dying_remaining": mine.get("dying_remaining", 0.0),
+        "spectating": mine.get("spectating", False),
+        "spectator_remaining": mine.get("spectator_remaining", 0.0),
+        # 服务端冻结的坐标 = 死亡点 / 复活点（旁观结束时客户端据此回位）
+        "pos_x": mine.get("pos_x", row.get("pos_x", 0.0)),
+        "pos_y": mine.get("pos_y", row.get("pos_y", 0.0)),
+        "pos_z": mine.get("pos_z", row.get("pos_z", 0.0)),
+        "yaw": mine.get("yaw", row.get("yaw", 0.0)),
     })
 
 
@@ -601,4 +631,187 @@ def handle_item(req, session, ctx) -> bytes:
     if row is None:
         return fail("item", E_BAD_PAYLOAD, "物品字段非法")
     return ok("item", {"id": row["id"], "world_rev": game.revisions()[0]})
+
+
+# ---------------------------------------------------------------------------
+# 种族 / 战斗 / 生死
+# ---------------------------------------------------------------------------
+
+@action("races")
+def handle_races(req, session, ctx) -> bytes:
+    """下发服务端裁定的可选种族（开发阶段只有人类）。
+
+    不需要登录：race.tscn 在注册流程里就要用它渲染选项。
+    """
+    return ok("races", {"races": [dict(r) for r in RACES]})
+
+
+@action("attack")
+def handle_attack(req, session, ctx) -> bytes:
+    """近战攻击。payload: ``<target_user_id>``。"""
+    need = _require_auth(req, session)
+    if need is not None:
+        return need
+
+    target = req.action_data.strip()
+    if not target:
+        return fail("attack", E_BAD_PAYLOAD, "缺少目标 player_id")
+    result = game.attack(session.user_id, target)
+    if not result.get("ok"):
+        return fail("attack", E_BAD_PAYLOAD, str(result.get("error") or "攻击失败"))
+    session.touch()
+    return ok("attack", result)
+
+
+@action("revive")
+def handle_revive(req, session, ctx) -> bytes:
+    """复活类治疗。payload: ``<target_user_id>``。"""
+    need = _require_auth(req, session)
+    if need is not None:
+        return need
+
+    target = req.action_data.strip()
+    if not target:
+        return fail("revive", E_BAD_PAYLOAD, "缺少目标 player_id")
+    result = game.revive(session.user_id, target)
+    if not result.get("ok"):
+        return fail("revive", E_BAD_PAYLOAD, str(result.get("error") or "治疗失败"))
+    session.touch()
+    return ok("revive", result)
+
+
+# ---------------------------------------------------------------------------
+# 资源下载（分块）
+# ---------------------------------------------------------------------------
+
+def _assets_root() -> Path:
+    return Path(_ctx.cfg.assets_dir)
+
+
+def _safe_asset_path(rel: str) -> Path | None:
+    """把客户端给的相对路径映射到资源根目录下；越界返回 None。
+
+    规则：忽略前导 ``/``；拒绝任何 ``..`` 段与盘符/绝对路径。
+    """
+    rel = (rel or "").replace("\\", "/").strip()
+    while rel.startswith("/"):
+        rel = rel[1:]
+    if not rel:
+        return _assets_root()
+    parts = [p for p in rel.split("/") if p not in ("", ".")]
+    if any(p == ".." for p in parts):
+        return None
+    if any(":" in p for p in parts):
+        return None
+    candidate = _assets_root().joinpath(*parts)
+    try:
+        root = _assets_root().resolve()
+        resolved = candidate.resolve()
+        if os.path.commonpath([str(root), str(resolved)]) != str(root):
+            return None
+    except (OSError, ValueError):
+        return None
+    return candidate
+
+
+def _asset_view(path: Path, rel: str) -> dict:
+    try:
+        st = path.stat()
+    except OSError:
+        return {"path": rel, "exists": False, "is_dir": False, "size": 0, "mtime": 0}
+    return {
+        "path": rel,
+        "exists": True,
+        "is_dir": path.is_dir(),
+        "size": 0 if path.is_dir() else int(st.st_size),
+        "mtime": int(st.st_mtime),
+    }
+
+
+@action("assets")
+def handle_assets(req, session, ctx) -> bytes:
+    """资源下载。payload: ``<sub>&<path>[&<offset>][&<length>]``。
+
+    sub：
+      list —— 列目录（name / is_dir / size / mtime）
+      stat —— 单文件/目录元信息
+      get  —— 分块读取，返回 base64 数据 + total + next_offset
+
+    分块大小由服务端定（默认 8192 字节），客户端按 ``next_offset`` 续拉。
+    """
+    need = _require_auth(req, session)
+    if need is not None:
+        return need
+
+    parts = [p.strip() for p in req.action_data.split("&")] if req.action_data else []
+    sub = parts[0].lower() if parts else ""
+    rel = parts[1] if len(parts) > 1 else ""
+    path = _safe_asset_path(rel)
+    if path is None:
+        return fail("assets", E_BAD_PAYLOAD, "非法资源路径")
+    if not path.exists():
+        return fail("assets", E_BAD_PAYLOAD, "资源不存在")
+
+    if sub == "list":
+        if not path.is_dir():
+            return fail("assets", E_BAD_PAYLOAD, "list 只能用于目录")
+        entries = []
+        try:
+            for child in sorted(path.iterdir(), key=lambda p: (not p.is_dir(), p.name.lower())):
+                view = _asset_view(child, str(child.relative_to(_assets_root())).replace("\\", "/"))
+                entries.append({
+                    "name": child.name,
+                    "is_dir": view["is_dir"],
+                    "size": view["size"],
+                    "mtime": view["mtime"],
+                })
+                if len(entries) >= 1000:
+                    break
+        except OSError:
+            log.exception("读取资源目录失败: %s", path)
+            return fail("assets", E_INTERNAL, "读取资源目录失败")
+        return ok("assets", {
+            "sub": "list",
+            "path": rel,
+            "root": str(_assets_root()),
+            "entries": entries,
+            "chunk_bytes": ctx.cfg.asset_chunk_bytes,
+        })
+
+    if sub == "stat":
+        view = _asset_view(path, rel)
+        view["sub"] = "stat"
+        return ok("assets", view)
+
+    if sub == "get":
+        if path.is_dir():
+            return fail("assets", E_BAD_PAYLOAD, "get 不能用于目录")
+        try:
+            offset = max(0, int(parts[2])) if len(parts) > 2 and parts[2] else 0
+            length = int(parts[3]) if len(parts) > 3 and parts[3] else ctx.cfg.asset_chunk_bytes
+        except ValueError:
+            return fail("assets", E_BAD_PAYLOAD, "offset / length 必须是整数")
+        length = max(1, min(length, ctx.cfg.asset_chunk_bytes))
+        total = path.stat().st_size
+        try:
+            with path.open("rb") as fh:
+                fh.seek(offset)
+                data = fh.read(length)
+        except OSError:
+            log.exception("读取资源失败: %s", path)
+            return fail("assets", E_INTERNAL, "读取资源失败")
+        next_offset = offset + len(data)
+        return ok("assets", {
+            "sub": "get",
+            "path": rel,
+            "offset": offset,
+            "length": len(data),
+            "total": int(total),
+            "next_offset": next_offset,
+            "eof": next_offset >= total,
+            "chunk_bytes": ctx.cfg.asset_chunk_bytes,
+            "data": base64.b64encode(data).decode("ascii"),
+        })
+
+    return fail("assets", E_BAD_PAYLOAD, "sub 必须是 list / stat / get")
 

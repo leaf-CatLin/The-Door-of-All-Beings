@@ -30,6 +30,7 @@ import secrets
 import signal
 import sys
 import threading
+from pathlib import Path
 
 import actions
 import anticheat
@@ -106,6 +107,7 @@ class Service:
             self.life.step(f"环境变量已写入 {len(written)} 项（{', '.join(written)}）")
         else:
             self.life.step("环境变量已是规范值，无需改写")
+        self._prepare_assets_dir()
 
         # --- ② 数据库游标 ---------------------------------------------------
         self._prepare_secret()
@@ -140,6 +142,20 @@ class Service:
         self.life.step(f"已注册动作：{', '.join(sorted(actions.ACTIONS))}")
         self.life.step(f"关闭回调栈（逆序执行）：{' <- '.join(reversed(self.life.hooks()))}")
         self.life.done()
+
+    def _prepare_assets_dir(self) -> None:
+        """确保资源根目录存在（不存在则创建）。
+
+        远端服务器上这是正常路径；本地 Windows 开发时默认 POSIX 路径通常建不出来，
+        只告警不拒启——assets 动作会在缺目录时返回“资源不存在”。
+        """
+        target = self.cfg.assets_dir
+        try:
+            Path(target).mkdir(parents=True, exist_ok=True)
+            self.life.step(f"资源目录已就绪：{target}")
+        except OSError as exc:
+            log.warning("资源目录不可用（%s）：%s", target, exc)
+            self.life.step(f"资源目录不可用（只告警）：{target}")
 
     def _prepare_secret(self) -> None:
         """设备 ID 签名密钥。
@@ -195,6 +211,11 @@ class Service:
         self.life.on_shutdown("game.autosave", game.stop_autosave)
         self.life.step(f"定时落库线程已启动（每 {self.cfg.autosave_interval} 秒）")
 
+        # 灵力 / 濒死 / 旁观计时器：每秒推进一次，离线玩家的灵力也照常累计
+        game.start_timers(interval=1.0)
+        self.life.on_shutdown("game.timers", game.stop_timers)
+        self.life.step("灵力与生死计时线程已启动（每秒结算）")
+
         started = anticheat.start(self.store, interval=5.0)
         self.life.on_shutdown("anticheat.stop", anticheat.stop)
         self.life.step(
@@ -239,6 +260,7 @@ class Service:
         # --- ① 最后落库 -----------------------------------------------------
         try:
             game.stop_autosave()
+            game.stop_timers()
             anticheat.stop()
             if self.store is not None and game.save(self.store):
                 self.life.step("玩家 / 世界数据已落库")
@@ -327,6 +349,11 @@ class Service:
                 ok = False
 
         log.info("已注册动作：%s", ", ".join(sorted(actions.ACTIONS)))
+        log.info(
+            "资源目录：%s（%s）",
+            self.cfg.assets_dir,
+            "可用" if Path(self.cfg.assets_dir).is_dir() else "不存在",
+        )
         return ok
 
     # ================================================================== #

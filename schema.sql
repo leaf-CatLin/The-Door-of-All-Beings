@@ -1,4 +1,4 @@
--- 众生之门 —— 数据库结构（v2）
+-- 众生之门 —— 数据库结构（v3：新增灵力 / 等级 / 生死流转 / 背包）
 --
 -- ===========================================================================
 -- 三条铁律
@@ -75,8 +75,17 @@ CREATE TABLE IF NOT EXISTS player (
     hp          DOUBLE PRECISION NOT NULL DEFAULT 100,    -- 当前生命值
     stamina_max DOUBLE PRECISION NOT NULL DEFAULT 100,    -- 体力上限
     stamina     DOUBLE PRECISION NOT NULL DEFAULT 100,    -- 当前体力
-    mana_max    DOUBLE PRECISION NOT NULL DEFAULT 100,    -- 灵力上限
-    mana        DOUBLE PRECISION NOT NULL DEFAULT 100,    -- 当前灵力
+    mana_max    DOUBLE PRECISION NOT NULL DEFAULT 100,    -- 灵力上限（旧的灵力池，保留兼容）
+    mana        DOUBLE PRECISION NOT NULL DEFAULT 100,    -- 当前灵力池值（保留兼容）
+    spirit      DOUBLE PRECISION NOT NULL DEFAULT 0,      -- 灵力（每小时 +1；升级会消耗）
+    level       INTEGER NOT NULL DEFAULT 1,               -- 等级（1 起，升级消耗灵力）
+    spirit_at   DOUBLE PRECISION NOT NULL DEFAULT 0,      -- 上次结算灵力的时间（epoch 秒；0 = 未结算）
+    death_at    DOUBLE PRECISION,                         -- 濒死开始时间（NULL = 非濒死）
+    spectator_until DOUBLE PRECISION,                     -- 旁观结束时间（NULL = 非旁观）
+    last_attacker TEXT NOT NULL DEFAULT '',               -- 最后一次造成伤害的玩家（死亡结算用）
+    inventory   JSONB NOT NULL DEFAULT '{}'::jsonb,       -- 背包（暂无 UI，先存空对象）
+    kills       INTEGER NOT NULL DEFAULT 0,               -- 击杀数
+    deaths      INTEGER NOT NULL DEFAULT 0,               -- 死亡数
     rev         BIGINT NOT NULL DEFAULT 0,                -- 修订号：只有更大才能覆盖
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -89,6 +98,15 @@ ALTER TABLE player ADD COLUMN IF NOT EXISTS stamina_max DOUBLE PRECISION NOT NUL
 ALTER TABLE player ADD COLUMN IF NOT EXISTS stamina     DOUBLE PRECISION NOT NULL DEFAULT 100;
 ALTER TABLE player ADD COLUMN IF NOT EXISTS mana_max    DOUBLE PRECISION NOT NULL DEFAULT 100;
 ALTER TABLE player ADD COLUMN IF NOT EXISTS mana        DOUBLE PRECISION NOT NULL DEFAULT 100;
+ALTER TABLE player ADD COLUMN IF NOT EXISTS spirit      DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE player ADD COLUMN IF NOT EXISTS level       INTEGER NOT NULL DEFAULT 1;
+ALTER TABLE player ADD COLUMN IF NOT EXISTS spirit_at   DOUBLE PRECISION NOT NULL DEFAULT 0;
+ALTER TABLE player ADD COLUMN IF NOT EXISTS death_at    DOUBLE PRECISION;
+ALTER TABLE player ADD COLUMN IF NOT EXISTS spectator_until DOUBLE PRECISION;
+ALTER TABLE player ADD COLUMN IF NOT EXISTS last_attacker TEXT NOT NULL DEFAULT '';
+ALTER TABLE player ADD COLUMN IF NOT EXISTS inventory   JSONB NOT NULL DEFAULT '{}'::jsonb;
+ALTER TABLE player ADD COLUMN IF NOT EXISTS kills       INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE player ADD COLUMN IF NOT EXISTS deaths      INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE player ADD COLUMN IF NOT EXISTS rev         BIGINT NOT NULL DEFAULT 0;
 
 
