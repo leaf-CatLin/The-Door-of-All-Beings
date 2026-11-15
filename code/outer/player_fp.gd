@@ -196,6 +196,18 @@ func get_yaw_degrees() -> float:
 	return rad_to_deg(rotation.y)
 
 
+## 瞄准俯仰角（度，protocol.md §4 第 9 段 / §11.3）：**抬头为正**、低头为负、0 = 水平。
+##
+## 符号约定（务必别搞反，服务端按 `sin(pitch)` 取 Y 分量）：
+##   * 协议：`pitch` 是**正数 = 抬头**；
+##   * Godot：`_head.rotation.x = deg_to_rad(_pitch_degrees)`，绕 +X 正转会把 −Z 前向抬向 +Y
+##     （实测 `Basis(X, +30°) * (0,0,-1) = (0, +0.5, -0.87)`）；`_apply_look` 里鼠标下移让
+##     `_pitch_degrees` 变小，也就等于低头。
+##   ⇒ `_pitch_degrees` **本身就是「抬头为正」**，与协议同号，这里直接返回，**不要取反**。
+func aim_pitch_degrees() -> float:
+	return _pitch_degrees
+
+
 func _apply_pitch(degrees: float) -> void:
 	_pitch_degrees = clampf(degrees, -pitch_limit_degrees, pitch_limit_degrees)
 	if _head != null:

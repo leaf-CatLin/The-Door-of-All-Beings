@@ -15,6 +15,8 @@ extends Node
 ##   * 本机：上报取 player_fp.head_world_position()，落位走 player_fp.teleport_head_to()；
 ##   * 远端代理：代理根节点在脚底，所以 peers 的头部坐标要减去 HEAD_OFFSET_Y 再插值；
 ##   * 掉落保护仍看脚底（world_base 读 player.global_position.y），不要跟着改。
+##   * 4.1.1：`state` 追加**可选第 9 段** `pitch`（瞄准俯仰，抬头为正，§4 / §11.3），
+##     来源 `player_fp.aim_pitch_degrees()`；8 段语义不变，老服务端忽略该段。
 ##
 ## 红名（v1.4 / §12）与战斗反馈：
 ##   * peers 行里的 `red` / `coord_base` 原样留在 _peer_rows 里；
@@ -243,6 +245,7 @@ func _process(delta: float) -> void:
 
 ## 本机上报的 `state` payload（格式由 GameApi.state_payload 统一维护）。
 ## §11.1：x/y/z 必须是**头部中心**，不是脚底 —— 服务端按头部做命中判定、落库与回写。
+## §4 第 9 段：最后追加瞄准俯仰角 `pitch`（度，抬头为正）；8 段语义完全不变，只是多一段可选值。
 func _state_payload() -> String:
 	var pos := _local_head_position()
 	var yaw := 0.0
@@ -252,7 +255,15 @@ func _state_payload() -> String:
 	if _player.has_method("get_horizontal_speed"):
 		speed = float(_player.call("get_horizontal_speed"))
 	var motion := MOTION_MOVING if speed > WALK_SPEED else MOTION_IDLE
-	return _api.state_payload(pos, yaw, hp, motion, stamina, mana)
+	return _api.state_payload(pos, yaw, hp, motion, stamina, mana, _local_aim_pitch())
+
+
+## 本机瞄准俯仰角（度，抬头为正，§4 第 9 段 / §11.3）。
+## player_fp 没提供时按 0（水平）兜底：老服务端与旧客户端都等价于「第 9 段缺省」。
+func _local_aim_pitch() -> float:
+	if _player != null and _player.has_method("aim_pitch_degrees"):
+		return float(_player.call("aim_pitch_degrees"))
+	return 0.0
 
 
 ## 本机头部中心的世界坐标（§11.1）。player_fp 没提供时按「脚底 + 1.65m」兜底。

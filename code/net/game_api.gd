@@ -17,6 +17,8 @@ extends Node
 ##   * `attack` 响应新增 `part` / `multiplier` / `damage` / `killer_red` / `victim_red`，
 ##     由 attack() 解析成 UI 能直接用的字段（含一句中文提示）。
 ##   * `state` 响应新增 `red`；peers 每行新增 `red` / `coord_base`（红名表现见 §12）。
+##   * 4.1.1：hello 追加能力位 `aim_pitch`；`state` payload 追加**可选第 9 段** `pitch`
+##     （瞄准俯仰角，度，抬头为正；8 段语义不变，老服务端会忽略这一段）。
 
 const TcpClient = preload("res://code/net/tcp_client.gd")
 const NetConfig = preload("res://code/net/net_config.gd")
@@ -71,6 +73,9 @@ var self_state: Dictionary = {}
 var coord_base := ""
 var hitboxes_enabled := false
 var attack_cone_deg := 60.0
+## 能力位（服务端 4.1.1 / §11.3）：服务端是否读懂 `state` 第 9 段 `pitch` 并按**3D 前向**判命中。
+## 缺省 false = 老服务端只看 yaw；此时本机照样把 pitch 发出去（多一段可选字段，老服务端会忽略）。
+var aim_pitch_enabled := false
 
 ## 最近一次 `attack` 的解析结果（结构见 parse_attack()）。
 ## HUD / net_sync 不方便拿返回值时读它。
@@ -162,10 +167,18 @@ func connect_and_hello() -> bool:
 	coord_base = str(data.get("coord_base", "")).strip_edges()
 	hitboxes_enabled = bool(data.get("hitboxes", false))
 	attack_cone_deg = float(data.get("attack_cone_deg", attack_cone_deg))
+	# 4.1.1 能力位：服务端是否按 3D 前向（yaw + pitch）判命中（§11.3）
+	aim_pitch_enabled = bool(data.get("aim_pitch", false))
 	if coord_base != "" and coord_base != COORD_BASE_HEAD:
 		push_warning("服务端坐标基准是 %s，客户端按 %s 上报，位置会整体偏移 %.2f 米" % [
 			coord_base, COORD_BASE_HEAD, HEAD_OFFSET_Y,
 		])
+	print("服务端能力：坐标基准 %s / 命中盒 %s / 朝向锥 %.0f° / 俯仰瞄准 %s" % [
+		coord_base if coord_base != "" else COORD_BASE_HEAD,
+		"开" if hitboxes_enabled else "关",
+		attack_cone_deg,
+		"开（state 第 9 段 pitch）" if aim_pitch_enabled else "关（老服务端只看 yaw）",
+	])
 	# v1.3：会话 Token 随首个 hello 响应下发，存下后后续请求自动携带
 	_adopt_session_token(data)
 	return true
@@ -411,9 +424,10 @@ func login_with_saved_account() -> bool:
 
 # ---------------------------------------------------------------- 世界
 
-## 上报自身状态。payload：`<x>&<y>&<z>&<yaw>[&hp][&state][&stamina][&mana]`。
+## 上报自身状态。payload：`<x>&<y>&<z>&<yaw>[&hp][&state][&stamina][&mana][&pitch]`。
 ## **`x/y/z` 是头部中心**（§11.1；脚底 = 头 − 1.65m），取 player_fp.head_world_position()。
-## 后四段都是可选的；本方法总是带满，方便服务端落库三围。
+## 后五段都是可选的；本方法总是带满，方便服务端落库三围。第 9 段 `pitch` 是瞄准俯仰角
+## （度，抬头为正，§4 / §11.3），缺省 0 = 水平，与旧服务端/旧客户端行为一致。
 ## （v1.3 起 net_sync 走 call_batch，真正在用的是下面的 state_payload() + apply_state_response()）
 func send_state(
 	pos: Vector3,
@@ -422,8 +436,11 @@ func send_state(
 	state := "idle",
 	stamina := 100.0,
 	mana := 100.0,
+	pitch_degrees := 0.0,
 ) -> Dictionary:
-	var res: Dictionary = await _call("state", state_payload(pos, yaw_degrees, hp, state, stamina, mana))
+	var res: Dictionary = await _call(
+		"state", state_payload(pos, yaw_degrees, hp, state, stamina, mana, pitch_degrees)
+	)
 	apply_state_response(res)
 	return res
 
@@ -431,6 +448,8 @@ func send_state(
 ## 拼 `state` 动作的 payload（静态：批量请求也要用，不能依赖实例）。
 ## `pos` 必须是**头部世界坐标**（§11.1），不要传脚底，否则服务端整体低 1.65 米。
 ## 三围与动作词都由调用方决定，本函数只负责格式（保留两位 / 一位小数）。
+## `pitch_degrees` 是**第 9 段**（4.1.1）：瞄准俯仰角，度，抬头为正，0 = 水平。
+## 它只是**追加**在 8 段之后的可选字段，前 8 段格式与语义一个字节都没动。
 static func state_payload(
 	pos: Vector3,
 	yaw_degrees: float,
@@ -438,9 +457,10 @@ static func state_payload(
 	state := "idle",
 	stamina := 100.0,
 	mana := 100.0,
+	pitch_degrees := 0.0,
 ) -> String:
-	return "%.2f&%.2f&%.2f&%.1f&%.0f&%s&%.0f&%.0f" % [
-		pos.x, pos.y, pos.z, yaw_degrees, hp, state, stamina, mana,
+	return "%.2f&%.2f&%.2f&%.1f&%.0f&%s&%.0f&%.0f&%.1f" % [
+		pos.x, pos.y, pos.z, yaw_degrees, hp, state, stamina, mana, pitch_degrees,
 	]
 
 

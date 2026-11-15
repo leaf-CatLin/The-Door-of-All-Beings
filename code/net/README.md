@@ -21,7 +21,7 @@ StartCreen.tscn / User(userDOM.gd)
         ① HTTP GET /api/v1/endpoint 发现 TCP 游戏服地址（失败才回退 NetConfig.host()/port()）
         ② TCP 建连（建连后服务端**不发任何帧**，不要等 PUSH）
         ③ 首个 hello：取 server_version / protocol_version / user_name_max_len / session_token
-           （v1.4 还回 coord_base / hitboxes / attack_cone_deg）
+           （v1.4 还回 coord_base / hitboxes / attack_cone_deg；4.1.1 再加 aim_pitch）
   → AccountStore.probe_device_integrity()   本地 .mac 验签；不过 → 弹窗征得同意才删残留文件
   → GameApi.ensure_device()                本地有 hex 就“确认”，没有就申一张（服务端签发）
   → 本地有账号 ? login(user_id) : check_name(name) → register(name, race, player_id)
@@ -30,7 +30,7 @@ StartCreen.tscn / User(userDOM.gd)
         → GameApi.login_with_saved_account()   重新建连并静默登录
         → 先按 login 回写的存档坐标落位（pos_x/y/z/yaw 是**头部坐标**，脚底 = 头 − 1.65m），
           **再**开上报，否则首帧会覆盖存档点
-        → _process 每 0.1s 一轮批量：第 2 行 = `state | <8 段>;;peers | `，服务端按序回两帧
+        → _process 每 0.1s 一轮批量：第 2 行 = `state | <9 段>;;peers | `，服务端按序回两帧
         → 意外断线：5s 宽限期内自动重连 + 重登，失败就静默降级单机
 ```
 
@@ -93,6 +93,22 @@ uv run main.py serve
   （「命中头部 ×2.0 50」）。`MISS` / `NOT_FACING` / `OUT_OF_RANGE` 各有中文提示；
   未升级的服务端只回 `BAD_PAYLOAD` + 中文 message，就退回 message。
 
+### 瞄准俯仰：`state` 第 9 段 `pitch`（服务端 4.1.1，§4 / §11.3）
+
+- 服务端 4.1.1 起命中射线是 **3D 前向** `(sin(yaw)·cos(pitch), sin(pitch), −cos(yaw)·cos(pitch))`，
+  `pitch` 由客户端在 `state` 上报：**第 9 段**（度，`0` = 水平，**正数 = 抬头**）。
+  8 段报文依旧合法，缺省 / 空 / 非法一律按 `0`（= 旧行为），老服务端会直接忽略第 9 段。
+- 客户端唯一出口：`player_fp.aim_pitch_degrees()` → `net_sync._local_aim_pitch()` →
+  `GameApi.state_payload(..., pitch_degrees)`。**符号与协议同号**：Godot 里
+  `Head.rotation.x` 正值就是抬头（`_apply_look` 里鼠标下移让它变小 = 低头），
+  所以 `aim_pitch_degrees()` 直接返回 `_pitch_degrees`，**不要取反**。
+- 后果（也是本补丁的目的）：等高平射（pitch=0）仍命中 `head`（×2）；**低头**才会依次打到
+  `neck` / `torso` / `thigh` / `shin`；**抬头**射线从头顶越过 → 服务端回 `MISS`。
+  客户端不做命中判定，只把相机俯仰如实上报；本地表现想对得上，就用同一条 3D 前向。
+- `hello.aim_pitch` 是能力位：`GameApi.aim_pitch_enabled`（缺省 `false`）。
+  `connect_and_hello()` 会打一行调试信息（坐标基准 / 命中盒 / 朝向锥 / 俯仰瞄准是否开启），
+  接老服务端时显示「俯仰瞄准 关（老服务端只看 yaw）」，而本机照样发第 9 段（多一段不会出错）。
+
 ### 红名（§12）
 
 - `state` 响应有自身 `red`，`peers` 每行有 `red` + `coord_base`；`net_sync` 把整行原样留在
@@ -135,6 +151,8 @@ v1.4 在此基础上**再加一个版本号**（报文/哈希/批量规则不变
 | **v1.4** `attack` 回 `part` / `multiplier` / `damage` / `killer_red` / `victim_red` | `game_api.parse_attack()` + HUD 一条短提示（`combat_message` → `hud.show_toast()`） |
 | **v1.4** `attack` 失败回 `MISS` / `NOT_FACING` / `OUT_OF_RANGE` | `game_api._explain_attack()` 三种中文提示；老服务端退回 `BAD_PAYLOAD` 的 message |
 | **v1.4** `state.red` / `peers[].red` / `peers[].coord_base` | HUD 红名徽标（`hud.set_red()`）+ 远端代理染红（`player_rig.set_red()`）；`coord_base='feet'` 的老行按行 −1.65m |
+| **4.1.1**（协议仍 1.4）`state` 追加可选第 9 段 `pitch`（瞄准俯仰，抬头为正） | `player_fp.aim_pitch_degrees()` → `net_sync._state_payload()` → `game_api.state_payload(..., pitch_degrees)`；8 段语义不变 |
+| **4.1.1** `hello` 追加能力位 `aim_pitch` | `game_api.aim_pitch_enabled`（缺省 false）；握手时打一行能力调试信息，不改攻击解析 |
 
 > 种族目前**只在本机保存**（`user://race.txt`），注册那一刻带给服务端；
 > 已注册账号的种族要等服务端加动作才能改。
