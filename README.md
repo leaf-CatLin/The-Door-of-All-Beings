@@ -7,8 +7,8 @@ HTTP 发现接口已拆到独立组件 **`server`**（仓库 `server` 分支）�
 
 | 项 | 值 |
 |---|---|
-| 协议版本 | **1.4**（4 行竖线报文，长连接，会话 Token，**无主动推送（客户端拉取）**，头+正文联合哈希，支持批量多 action，头部坐标基准 + 部位命中 + 红名；兼容 v1.0~v1.3） |
-| 服务版本 | **4.1.0** |
+| 协议版本 | **1.4**（4 行竖线报文，长连接，会话 Token，**无主动推送（客户端拉取）**，头+正文联合哈希，支持批量多 action，头部坐标基准 + 部位命中 + 红名 + **俯仰瞄准 pitch**；兼容 v1.0~v1.3） |
+| 服务版本 | **4.1.1** |
 | TCP 游戏端口 | `TCP_PORT`（默认跟随 `PORT`，即 **5423**） |
 | 存储 | PostgreSQL（生产）/ 内存（调试与测试） |
 | 依赖 | Python 3.12 · psycopg2-binary · python-dotenv |
@@ -98,7 +98,7 @@ server-socket/
 
 ```bash
 # 协议全链路（内存后端，起真 TCP，不用数据库）
-uv run scripts/tcp_smoke_test.py          # 当前 219/219
+uv run scripts/tcp_smoke_test.py          # 当前 242/242
 uv run scripts/tcp_smoke_test.py -v       # 逐条打印
 
 # PostgreSQL 存储层（用真库，但只碰自己造的临时数据，跑完清理）
@@ -115,6 +115,8 @@ uv run main.py check
 **v1.4**：hello 的 `coord_base`/`hitboxes`/`attack_cone_deg`、部位命中（头部 50 / 躯干 25）、
 `MISS` / `NOT_FACING` / `OUT_OF_RANGE`、红名可见（`state.red` / `peers[].red`）、
 真死亡后击杀者变红 + 受害者清红名、legacy(0.1.0) 脚底坐标 ±1.65m 换算、`coord_base='feet'` 旧行迁移（含幂等）。
+**4.1.1**：`hello.aim_pitch`、`state` 第 9 段 pitch 的俯仰瞄准（平射命中头部 / 低头命中躯干 /
+抬头 `MISS` / 第 9 段缺省与非法值都等价于 0）。
 
 `store_check.py` 覆盖：users 唯一冲突归类（设备 / user_id / user_name）、SAVEPOINT 回滚不污染事务、
 登录查询与活跃时间、world + world_item 落库与 **rev 门槛三态**（落后被拒 / 相等被拒 / 领先写入）、
@@ -275,9 +277,10 @@ WHERE player.rev < EXCLUDED.rev
 
 - `hitbox.HUMAN_BODY`：11 个相对头部中心的盒子（`head` ×2.0 / `neck` ×1.5 / `torso` ×1.0 /
   `upper_arm_*` ×0.6 / `forearm_*` ×0.5 / `thigh_*` ×0.8 / `shin_*` ×0.6）。
-- `hitbox.resolve_hit`：射线原点 = 攻击者头部，方向 = 攻击者 `yaw` 的水平前向；
+- `hitbox.resolve_hit`：射线原点 = 攻击者头部，方向 = 攻击者 `yaw` + `pitch` 推出的 **3D 前向**
+  （`pitch` 来自 `state` 第 9 段，0 = 水平、正 = 抬头；缺省 / 非法按 0，只在内存里记，不落库）；
   变换到目标局部系后对 11 个 AABB 做 slab 测试，取 `t` 最小者。伤害 = `25 × 倍率`（取整到 0.1）。
-- 朝向锥 60°（`hitbox.facing_ok`）不过 → `NOT_FACING`；射程内没打到盒子 → `MISS`；超 3m → `OUT_OF_RANGE`。
+- 朝向锥 60°（`hitbox.facing_ok`，与射线同一条 3D 前向）不过 → `NOT_FACING`；射程内没打到盒子 → `MISS`；超 3m → `OUT_OF_RANGE`。
 - 服务端**不再自动把攻击者转向目标**：`yaw` 以客户端最近一次 `state` 上报为准。
 
 **红名（protocol.md §12）**
@@ -356,6 +359,18 @@ ufw allow 5423/tcp
 | 冒烟测试 | 153 项 | **219 项**（新增部位命中 / 三种失败 / 红名 / 坐标换算 / 迁移） |
 
 > 冻结契约在 `protocol.md` §11 / §12：字段名、11 个盒子的数值、倍率、错误码都不要改，改动先改文档。
+
+### 10.3 4.1.1 的变化（协议**仍是 1.4**：纯追加可选字段）
+
+| 方面 | 4.1.0（协议 1.4） | 4.1.1（协议 1.4） |
+|---|---|---|
+| 攻击方向 | 攻击者 `yaw` 的**水平**前向（等高平砍必穿头部盒 → 永远爆头） | **3D 前向** `(sin(yaw)cos(pitch), sin(pitch), −cos(yaw)cos(pitch))` |
+| 瞄准俯仰 | 无 | `state` 追加**可选第 9 段** `pitch`（度，0 = 水平、正 = 抬头；缺省 / 空 / 非法 = 0） |
+| 朝向锥 | 用水平前向 | 用**同一条 3D 前向**（抬头 / 低头都会影响锥校验） |
+| 能力位 | — | `hello` 追加 `"aim_pitch": true` |
+| 存储 | — | `pitch` **只在内存**（`player` 表不加列，不进 `peers`） |
+| 协议版本 | `1.4` | `1.4`（8 段报文与旧客户端行为完全不变，老服务端会忽略第 9 段） |
+| 冒烟测试 | 219 项 | **242 项**（新增俯仰瞄准 4 组用例） |
 
 ---
 

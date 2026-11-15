@@ -17,14 +17,14 @@
 --------------------------------------------
 §11.3 第 1 条写的是「方向 = normalize(目标头部 − 攻击者头部)」。若照字面实现，
 射线终点正好落在 ``head`` 盒中心（半尺寸 0.10~0.11m），**任何射程内攻击都必然先命中头部**，
-11 个盒子、部位倍率与 ``MISS`` 错误码全部不可达。因此这里按「射线方向 = 攻击者 ``yaw``
-推出的前向（水平，``+Y`` 分量为 0）」实现：
+11 个盒子、部位倍率与 ``MISS`` 错误码全部不可达。因此这里按「射线方向 = 攻击者
+``yaw`` + ``pitch`` 推出的 3D 单位前向」实现（服务 4.1.1 起带俯仰，此前是水平前向）：
 
-* 朝向（60° 锥）单独校验，见 :func:`facing_ok`，不通过 → ``NOT_FACING``；
+* 朝向（60° 锥）单独校验，见 :func:`facing_ok`，用**同一条 3D 前向**，不通过 → ``NOT_FACING``；
 * 射线与目标身体求交，全不中 → ``MISS``；
-* 目标与攻击者等高时射线正好穿过 ``head`` 盒（头部一击伤害 ×2），
-  目标更低（台阶 / 坡地）时依次穿过 ``neck`` / ``torso`` / ``thigh`` / ``shin``，
-  这才能让 11 个盒子的倍率真正生效。
+* ``pitch = 0``（水平）时射线正好穿过 ``head`` 盒（头部一击伤害 ×2）；**低头**（``pitch < 0``）
+  时依次穿过 ``neck`` / ``torso`` / ``thigh`` / ``shin``；**抬头**（``pitch > 0``）时从头顶越过 →
+  ``MISS``。这才能让 11 个盒子的倍率真正生效，也才不会「等高平地对砍永远爆头」。
 
 ``resolve_hit`` 的 ``attacker_head`` 只用来给出射线**原点**，``target_head`` 是目标
 局部系的**原点**（减目标头部、再绕 Y 反向旋转目标 ``yaw``）；两者都不能省。
@@ -40,6 +40,10 @@ HEAD_OFFSET_Y = 1.65
 
 ## 攻击朝向锥：攻击者前向与「指向目标头部」的夹角上限（度，冻结）
 ATTACK_CONE_DEG = 60.0
+
+## 瞄准俯仰角的合法范围（度）：超出按边界夹住，保证 cos(pitch) >= 0（射线不会朝后翻）。
+## 客户端自身把视角夹在 ±85°，这里只是服务端的防御性上限。
+AIM_PITCH_LIMIT = 90.0
 
 ## 近战射程（米）：与 game.ATTACK_RANGE 同值；这里只作为 resolve_hit 的默认值，
 ## 真正的射程判定由调用方（game.attack）用 game.ATTACK_RANGE 传入。
@@ -97,15 +101,37 @@ def feet_from_head(head_y: float) -> float:
     return float(head_y) - HEAD_OFFSET_Y
 
 
-def forward(yaw: float) -> tuple[float, float, float]:
-    """由 ``yaw``（度）推出单位前向：0 = 正北 / −Z，顺时针为正。
+def norm_pitch(degrees) -> float:
+    """把瞄准俯仰角归一成 ``[-90, 90]`` 度；非法值（非数字 / NaN / inf）回 0（水平）。
 
-    yaw = 0   → (0, 0, -1)
-    yaw = 90  → (1, 0, 0)   正东
-    yaw = 180 → (0, 0, 1)   正南
+    协议 §4 第 9 段：``0`` = 水平、正数 = 抬头；**缺省 / 空 / 非法一律按 0**（旧客户端行为不变）。
     """
-    rad = math.radians(float(yaw) % 360.0)
-    return (math.sin(rad), 0.0, -math.cos(rad))
+    try:
+        value = float(degrees)
+    except (TypeError, ValueError):
+        return 0.0
+    if not math.isfinite(value):
+        return 0.0
+    return max(-AIM_PITCH_LIMIT, min(AIM_PITCH_LIMIT, value))
+
+
+def forward(yaw: float, pitch: float = 0.0) -> tuple[float, float, float]:
+    """由 ``yaw`` / ``pitch``（度）推出单位 **3D** 前向（protocol.md §11.3）。
+
+    * ``yaw``：0 = 正北 / −Z，顺时针为正（约定不变）；
+    * ``pitch``：0 = 水平，**正数 = 抬头**（``+Y`` 分量为 ``sin(pitch)``）；缺省 0 = 水平射线。
+
+    ``direction = (sin(yaw)·cos(pitch), sin(pitch), −cos(yaw)·cos(pitch))``
+
+    yaw = 0, pitch = 0    → (0, 0, -1)
+    yaw = 90, pitch = 0   → (1, 0, 0)    正东
+    yaw = 0, pitch = 90   → (0, 1, 0)    正上
+    yaw = 0, pitch = -90  → (0, -1, 0)   正下
+    """
+    yaw_rad = math.radians(float(yaw) % 360.0)
+    pitch_rad = math.radians(norm_pitch(pitch))
+    cos_p = math.cos(pitch_rad)
+    return (math.sin(yaw_rad) * cos_p, math.sin(pitch_rad), -math.cos(yaw_rad) * cos_p)
 
 
 def _sub(a, b) -> tuple[float, float, float]:
@@ -121,17 +147,20 @@ def facing_ok(
     attacker_head,
     target_head,
     cone_deg: float = ATTACK_CONE_DEG,
+    attacker_pitch: float = 0.0,
 ) -> bool:
     """朝向锥校验（§11.3 第 2 条）。
 
-    ``dot(攻击者前向, normalize(目标头部 − 攻击者头部)) >= cos(cone_deg)``。
+    ``dot(攻击者 3D 前向, normalize(目标头部 − 攻击者头部)) >= cos(cone_deg)``。
+    ``attacker_pitch`` 与射线方向同一个符号约定（0 = 水平，正 = 抬头）；
+    抬头 / 低头都会把这条 3D 前向抬离水平面，因此锥校验与射线方向一致。
     两点重合（退化射线）一律视为不通过。
     """
     delta = _sub(target_head, attacker_head)
     dist = _length(delta)
     if dist <= _EPS:
         return False
-    fx, fy, fz = forward(attacker_yaw)
+    fx, fy, fz = forward(attacker_yaw, attacker_pitch)
     dot = (fx * delta[0] + fy * delta[1] + fz * delta[2]) / dist
     return dot >= math.cos(math.radians(cone_deg)) - _EPS
 
@@ -202,17 +231,19 @@ def resolve_hit(
     target_head,
     target_yaw: float,
     max_range: float = ATTACK_RANGE,
+    attacker_pitch: float = 0.0,
 ) -> tuple[str, float, float] | None:
     """射线命中判定：返回 ``(part, multiplier, t)``，全不中返回 ``None``。
 
     * 原点 = ``attacker_head``；
-    * 方向 = ``attacker_yaw`` 推出的水平前向（见模块顶部「关于射线方向」）；
+    * 方向 = ``attacker_yaw`` + ``attacker_pitch`` 推出的 **3D 前向**
+      （见模块顶部「关于射线方向」；``pitch`` 缺省 0 = 旧版水平射线）；
     * 把射线变换到目标局部系后，对 11 个盒子做 slab 测试，
       取 ``t`` 最小且 ``t <= max_range`` 的盒子（即最先进入的那个盒子）。
     """
     ox, oy, oz = (float(attacker_head[0]), float(attacker_head[1]), float(attacker_head[2]))
     origin_local = to_local((ox, oy, oz), target_head, target_yaw)
-    fx, fy, fz = forward(attacker_yaw)
+    fx, fy, fz = forward(attacker_yaw, attacker_pitch)
     direction_local = direction_to_local((fx, fy, fz), target_yaw)
 
     best: tuple[str, float, float] | None = None

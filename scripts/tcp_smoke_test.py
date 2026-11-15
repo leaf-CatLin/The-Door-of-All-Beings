@@ -1,4 +1,4 @@
-"""TCP 协议冒烟测试（v1.4：联合哈希 + 批量多 action + 部位命中 + 红名 + 坐标基准）。
+"""TCP 协议冒烟测试（v1.4：联合哈希 + 批量多 action + 部位命中 + 俯仰瞄准 + 红名 + 坐标基准）。
 
 用法::
 
@@ -17,6 +17,8 @@
    **v1.4 新增**：身体碰撞箱部位命中（头部 50 / 躯干 25）/ MISS / NOT_FACING /
    OUT_OF_RANGE / 真死亡后击杀者变红 / 死亡清红名 / legacy(0.1.0) 脚底坐标换算 /
    coord_base='feet' 旧行的一次性迁移。
+   **4.1.1 新增**：`state` 第 9 段 `pitch` 的俯仰瞄准（平射爆头 / 低头打躯干 / 抬头 MISS /
+   缺省与非法值等价于 0）。
 
 退出码 0 = 全绿。
 """
@@ -289,11 +291,12 @@ def run(verbose: bool = False) -> int:
         t.check(r is not None and r.ok, "hello 应 OK")
         if r is not None and r.ok:
             t.eq(r.data.get("protocol_version"), "1.4", "协议版本升到 1.4")
-            t.eq(r.data.get("server_version"), "4.1.0", "服务版本 4.1.0")
+            t.eq(r.data.get("server_version"), "4.1.1", "服务版本 4.1.1")
             t.eq(r.data.get("coord_base"), "head", "协议坐标基准 = 头部")
             t.eq(r.data.get("coord_base_applied"), "head", "0.2.0 客户端实际按 head")
             t.eq(r.data.get("hitboxes"), True, "服务端启用身体碰撞箱")
             t.eq(r.data.get("attack_cone_deg"), 60, "攻击朝向锥 60°")
+            t.eq(r.data.get("aim_pitch"), True, "能力位 aim_pitch（state 第 9 段俯仰瞄准）")
 
         t.case("联合哈希：篡改请求头会让哈希失效")
         pkt = protocol.build_request("ping", session_token=a.token)
@@ -614,6 +617,75 @@ def run(verbose: bool = False) -> int:
             t.eq(r.data.get("multiplier"), 1.0, "躯干倍率 1.0")
             t.eq(r.data.get("damage"), 25.0, "躯干伤害 = 25 × 1 = 25")
             t.eq(r.data.get("hp"), 25.0, "目标 HP 50 - 25")
+
+        t.case("aim pitch：state 第 9 段俯仰瞄准改变命中部位")
+        # 等高、间距 1m：pitch 只把射线压 / 抬，水平距离不变。
+        # 注意 `state` 的 hp 段服务端只读不收（客户端不能改 HP），所以用 mutate 直接回满。
+        with game.mutate():
+            brow = game.players[b.user_id]
+            brow["hp"] = 100.0
+            brow["rev"] = int(brow.get("rev", 0)) + 1
+        r = a.call("state", "0&1.65&0&0&100&idle&100&100&0")
+        t.check(r is not None and r.ok, "a 上报（pitch=0，平射）")
+        r = b.call("state", "0&1.65&-1&180&100&idle&100&100&0")
+        t.check(r is not None and r.ok, "b 报到 1m")
+        time.sleep(0.08)
+        r = a.call("attack", b.user_id)
+        t.check(r is not None and r.ok, f"等高平射应命中 got={r}")
+        if r is not None and r.ok:
+            t.eq(r.data.get("part"), "head", "pitch=0 → 平射穿过头部盒")
+            t.eq(r.data.get("multiplier"), 2.0, "头部倍率 2.0")
+            t.eq(r.data.get("damage"), 50.0, "头部伤害 50")
+
+        r = a.call("state", "0&1.65&0&0&100&idle&100&100&-25")   # 低头 25°
+        t.check(r is not None and r.ok, "a 低头 25° 上报")
+        time.sleep(0.08)
+        r = a.call("attack", b.user_id)
+        t.check(r is not None and r.ok, f"pitch=-25 应命中躯干或更低部位 got={r}")
+        if r is not None and r.ok:
+            t.eq(r.data.get("part"), "torso", "pitch=-25 → 1m 处压低约 0.47m，命中躯干盒")
+            t.eq(r.data.get("multiplier"), 1.0, "躯干倍率 1.0")
+            t.eq(r.data.get("damage"), 25.0, "躯干伤害 25")
+
+        r = a.call("state", "0&1.65&0&0&100&idle&100&100&35")    # 抬头 35°
+        t.check(r is not None and r.ok, "a 抬头 35° 上报")
+        time.sleep(0.08)
+        r = a.call("attack", b.user_id)
+        t.check(r is not None and r.kind == "FAIL", f"pitch=+35 应打空 got={r}")
+        if r is not None:
+            t.eq(r.code, protocol.E_MISS, "抬头越过目标头部 → MISS（不是 NOT_FACING）")
+
+        # 第 9 段缺省 / 非法值都必须等价于 pitch=0（旧客户端行为不变）
+        with game.mutate():
+            brow = game.players[b.user_id]
+            brow["hp"] = 100.0
+            brow["rev"] = int(brow.get("rev", 0)) + 1
+        r = a.call("state", "0&1.65&0&0&100&idle&100&100")       # 只有 8 段
+        t.check(r is not None and r.ok, "8 段报文（省略 pitch）上报")
+        time.sleep(0.08)
+        r = a.call("attack", b.user_id)
+        t.check(r is not None and r.ok, f"省略 pitch 应等价平射 got={r}")
+        if r is not None and r.ok:
+            t.eq(r.data.get("part"), "head", "省略第 9 段 → pitch=0（命中头部）")
+
+        with game.mutate():
+            brow = game.players[b.user_id]
+            brow["hp"] = 100.0
+            brow["rev"] = int(brow.get("rev", 0)) + 1
+        r = a.call("state", "0&1.65&0&0&100&idle&100&100&abc")   # 非法值
+        t.check(r is not None and r.ok, "非法 pitch 应被宽容收下（不报 BAD_PAYLOAD）")
+        time.sleep(0.08)
+        r = a.call("attack", b.user_id)
+        t.check(r is not None and r.ok, f"非法 pitch 应等价平射 got={r}")
+        if r is not None and r.ok:
+            t.eq(r.data.get("part"), "head", "非法 pitch → 0（命中头部）")
+
+        # 收尾：回到下一组用例要求的位置与朝向（4 段报文 → 第 9 段归 0）
+        r = a.call("state", "0&1.65&0&0")
+        t.check(r is not None and r.ok, "a 回到起点（俯仰归 0）")
+        r = b.call("state", "0&1.65&-2&180")
+        t.check(r is not None and r.ok, "b 回到 2m")
+        time.sleep(0.08)
 
         t.case("attack 三种失败：MISS / NOT_FACING / OUT_OF_RANGE")
         r = a.call("state", "0&1.65&0&20")          # 偏 20°：仍在 60° 锥内但打空

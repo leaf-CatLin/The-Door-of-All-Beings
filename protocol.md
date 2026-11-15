@@ -2,7 +2,7 @@
 
 > 实现：`protocol.py`（解析/编码）· `server.py`（监听/帧读取）· `session.py`（长连接、会话 Token、宽限期、坐标基准）· `actions.py`（动作表）· `game.py`（热缓存/战斗/死亡）· `hitbox.py`（身体碰撞箱）· `karma.py`（红名判定）
 > 业务流程：`flows.md`（注册 / 登录 / 正常下线 / 意外断开宽限期 / 客户端重连 / 生死流转）
-> 状态：**已实现并通过冒烟测试**（`scripts/tcp_smoke_test.py`，219 项）
+> 状态：**已实现并通过冒烟测试**（`scripts/tcp_smoke_test.py`，242 项）
 
 v1.4 相对 v1.3 的三处变更（**只加语义，报文结构与哈希规则不变**）：
 
@@ -11,6 +11,13 @@ v1.4 相对 v1.3 的三处变更（**只加语义，报文结构与哈希规则�
 2. **身体碰撞箱 + 部位命中**（§11.2 / §11.3）：服务端按 11 个盒子判定命中部位，
    伤害 = 25 × 倍率；新增错误码 `NOT_FACING` / `MISS` / `OUT_OF_RANGE`。
 3. **红名（Karma）**（§12）：人类击杀同势力人类 → 击杀者变红；确认死亡解除受害者红名。
+
+服务版本 **4.1.1** 的新增（**协议号仍是 1.4**：纯追加可选字段，8 段报文与旧服务端都不受影响）：
+
+1. **瞄准俯仰 `pitch`**（§4 第 9 段 / §11.3）：`state` 可选第 9 段上报俯仰角（0 = 水平，正 = 抬头），
+   攻击方向由「水平前向」改为 `yaw × pitch` 的 **3D 前向**，60° 朝向锥也用同一条 3D 前向。
+   `hello` 追加能力位 `"aim_pitch": true`。
+2. 其余全部不动：11 个盒子的数值、倍率、字段名、错误码 `MISS` / `NOT_FACING` / `OUT_OF_RANGE`。
 
 v1.3 的三处变更（继续生效）：
 
@@ -188,7 +195,7 @@ FAIL | <action> | <code> | <message>
 | `SESSION_TOKEN_EXPIRED` | Token 与本会话不一致（已失效 / 拿的是上一条连接的） | 清掉本地 token，重新 `hello` + `login` |
 | `OUT_OF_RANGE` | 攻击目标超出 `ATTACK_RANGE`（3m） | 走近再打 |
 | `NOT_FACING` | 目标不在攻击朝向锥（60°）内 | 转向目标（按自己的 `yaw` 校正） |
-| `MISS` | 射程与朝向都过，但射线没打到任何身体盒子 | 别乱挥，瞄准身体 |
+| `MISS` | 射程与朝向都过，但射线没打到任何身体盒子 | 别乱挥，瞄准身体（第 9 段 `pitch` 可调俯仰） |
 | `INTERNAL_ERROR` | 服务端内部异常 | 稍后重试 |
 | `TOO_MANY_CONNECTIONS` | 连接数已满 | 退避重连 |
 
@@ -236,7 +243,7 @@ FAIL | <action> | SESSION_TOKEN_EXPIRED | Token mismatch, please use the latest 
 | `login` | JSON `{"player_id":"<user_id>","file_hash":"<hex>"}` | 否 | 登录。旧写法兼容：非 JSON 时整段当 `user_id`（不参与文件校验） |
 | `logout` | 空 | 否 | 正常下线：**完整拆除**（置离线 → 落库 → 销毁 → 作废 token；不再停推送/广播） |
 | `whoami` | 空 | 否 | 当前会话账号信息 |
-| `state` | `<x>&<y>&<z>&<yaw>[&hp][&state][&stamina][&mana]` | **是** | 上报自身位置/状态 |
+| `state` | `<x>&<y>&<z>&<yaw>[&hp][&state][&stamina][&mana][&pitch]` | **是** | 上报自身位置/状态 |
 | `peers` | 空 | **是** | **拉取**一次在线玩家快照（取代旧 PUSH world） |
 | `world` | 空 | 否 | **拉取**一次世界元信息 + 全部物品快照 |
 | `item` | `<id>&[kind]&<x>&<y>&<z>&<yaw>[&state]` | **是** | 增/改一个世界物品 |
@@ -244,7 +251,7 @@ FAIL | <action> | SESSION_TOKEN_EXPIRED | Token mismatch, please use the latest 
 `state` 的 `state` 取值：`idle` / `moving` / `dead`（其他值归为 `idle`）。
 坐标绝对值上限 `100000`（非法坐标回 `BAD_PAYLOAD`）。
 
-后四段全部**可省略**，省略就保持原值：
+后五段全部**可省略**，省略就保持原值（第 9 段 `pitch` 例外：省略 / 空 / 非法一律按 **0**，见下）：
 
 | 段位 | 字段 | 范围 | 说明 |
 |---|---|---|---|
@@ -252,6 +259,11 @@ FAIL | <action> | SESSION_TOKEN_EXPIRED | Token mismatch, please use the latest 
 | 6 | `state` | 见上 | 与 v1.1 位置一致（放中间是为了不破坏老报文） |
 | 7 | `stamina` | `0 .. stamina_max` | 当前体力 |
 | 8 | `mana` | `0 .. mana_max` | 当前灵力 |
+| 9 | `pitch` | `-90 .. 90`（度） | **瞄准俯仰角**：`0` = 水平，**正数 = 抬头**，负数 = 低头。可选，缺省 / 空串 / 非法值一律按 `0` 处理（等价于旧客户端行为） |
+
+> 第 9 段是 **v1.4 内追加的可选字段**：8 段报文完全合法、语义不变；老服务端会忽略多出来的第 9 段。
+> 服务端只把这个值用在**攻击方向**上（§11.3），**不落库**、也不参与 `peers` 下发。
+> 实现上超出 ±90° 会被夹到边界（`cos(pitch) >= 0`，射线不会朝后翻）。
 
 > 三围上限（`hp_max` / `stamina_max` / `mana_max`）默认都是 100，**客户端目前不能改**（将来由 `admin` 或成长系统改）。
 > 每次上报都会让该玩家的 `rev += 1`，响应里的 `rev` 就是回写给客户端的行修订号。
@@ -295,7 +307,7 @@ OK | world | {"world":{"id":"default","name":"众生之门","seed":0,"rev":5},
 ```
 OK | register | {"user_id":"ZWME-2WKQ","user_name":"勇者",
                   "player_id":"a3f1c8d2-…","player_name":"勇者","race":"elf",
-                  "server_version":"4.1.0","protocol_version":"1.4"}
+                  "server_version":"4.1.1","protocol_version":"1.4"}
 ```
 
 `login` 响应（`server_push=false` / `push_hz=0`，并回写 `session_token`）：
@@ -305,7 +317,7 @@ OK | login | {"user_id":"ZWME-2WKQ","user_name":"勇者",
               "player_id":"a3f1c8d2-…","player_name":"勇者","race":"human",
               "pos_x":12.5,"pos_y":1.65,"pos_z":-8.0,"coord_base":"head","yaw":90.0,
               "server_push":false,"push_hz":0,"session_token":"9f2c…(32 hex)",
-              "server_version":"4.1.0","protocol_version":"1.4"}
+              "server_version":"4.1.1","protocol_version":"1.4"}
 ```
 
 > `pos_x/pos_y/pos_z/yaw` 是该玩家**上次退出的存档位置**（`enter_world` 已从库/缓存恢复），
@@ -345,7 +357,7 @@ OK | logout | {"authenticated":false,"saved":true,"user_id":"ZWME-2WKQ"}
 ```
 OK | device | {"device_id":"ab12…","length":1024,"issued_at":1761379200,
                 "known":true,"stored":true,"account":{"user_id":"ZWME-2WKQ","user_name":"勇者"},
-                "server_version":"4.1.0","protocol_version":"1.4"}
+                "server_version":"4.1.1","protocol_version":"1.4"}
 ```
 
 `account` 为 `null` 表示这台设备还没绑账号 → 走 `check_name` + `register`。
@@ -375,13 +387,13 @@ C→S  TheDoorOfBings | 1.4 | 1761379200 | none | 0.2.0 | windows | zh_CN
       |  |
      <64hex> | <64hex>          ← 首条 hello 无 token（第 3 行 2 段），哈希覆盖头+正文
 
-S→C  OK | hello | {"magic":"TheDoorOfBings","server_version":"4.1.0","protocol_version":"1.4",
+S→C  OK | hello | {"magic":"TheDoorOfBings","server_version":"4.1.1","protocol_version":"1.4",
                     "server_push":false,"push_hz":0,"autosave_interval":60,"device_id_length":1024,
                     "user_name_max_len":24,"session_token":"9f2c…(32 hex)",
                     "actions":["assets","attack","check_name","device","hello","item","login","logout",
                     "peers","ping","races","register","revive","state","whoami","world"],
                     "coord_base":"head","coord_base_applied":"head","hitboxes":true,
-                    "attack_cone_deg":60,"now":1761379200}
+                    "attack_cone_deg":60,"aim_pitch":true,"now":1761379200}
 
 C→S  … device | 
      9f2c…(token) |  |
@@ -389,7 +401,7 @@ C→S  … device |
 
 S→C  OK | device | {"device_id":"ab12…(2048 hex)","length":1024,"issued_at":1761379200,
                      "known":false,"stored":false,"account":null,
-                     "server_version":"4.1.0","protocol_version":"1.4"}
+                     "server_version":"4.1.1","protocol_version":"1.4"}
 
 C→S  … check_name | 勇者
      9f2c…(token) | <device_hex> | 
@@ -403,12 +415,13 @@ C→S  … register | 勇者&elf&a3f1c8d2-…
 
 S→C  OK | register | {"user_id":"ZWME-2WKQ","user_name":"勇者",
                        "player_id":"a3f1c8d2-…","player_name":"勇者","race":"elf",
-                       "server_version":"4.1.0","protocol_version":"1.4"}
+                       "server_version":"4.1.1","protocol_version":"1.4"}
 
-C→S  … state | 12.5&1.65&-8&180&77&moving&33&44;;peers |
+C→S  … state | 12.5&1.65&-8&180&77&moving&33&44&-12;;peers |
      9f2c…(token) |  |
      …                            ← 批量：一次报文里上报位置 + 拉取在线列表
-                                    （v1.4 的 y=1.65 是头部中心；旧客户端写脚底值即可）
+                                    （v1.4 的 y=1.65 是头部中心；旧客户端写脚底值即可；
+                                     第 9 段 -12 = 低头 12°，可选，不写就是 0）
 
 S→C  OK | state | {"t":1761379200,"seq":2,"rev":2,"pos_y":1.65,"red":false,"coord_base":"head",…}
 S→C  OK | peers | {"players":[…],"players_rev":2,"world_rev":5,"coord_base":"head","t":1761379200}
@@ -442,14 +455,14 @@ S→C  OK | logout | {"authenticated":false,"saved":true,"user_id":"ZWME-2WKQ"}
 | 路径 | 说明 |
 |---|---|
 | `GET /` | 服务名与版本 |
-| `GET /api/v1/endpoint` | `{"tcp":{"host":"…","port":5423},"protocol_version":"1.4","service_version":"4.1.0","transport":"tcp","encoding":"utf-8"}` |
+| `GET /api/v1/endpoint` | `{"tcp":{"host":"…","port":5423},"protocol_version":"1.4","service_version":"4.1.1","transport":"tcp","encoding":"utf-8"}` |
 | `GET /game/api` | 同上（旧路径，过渡期保留） |
 | `GET /healthz` | 健康检查（仅 HTTP 服务自身，不含游戏服状态） |
 
 `host` / `port` 来自 server 组件的 `.env`（`HOST` / `PORT`），需与本组件的实际监听地址一致。
 
 > ⚠️ 下发版本号写死在 server 组件的 `config.py`（`PROTOCOL_VERSION` / `SERVICE_VERSION`），
-> 该分支若仍是旧值，**需要跟着改成 `1.4` / `4.1.0`**，否则客户端会拿到旧的兼容提示。
+> 该分支若仍是旧值，**需要跟着改成 `1.4` / `4.1.1`**，否则客户端会拿到旧的兼容提示。
 > 协议本身向后兼容（v1.4 服务端仍接受 v1.0~v1.3 报文），不影响连入。
 
 ---
@@ -501,7 +514,7 @@ S→C  OK | logout | {"authenticated":false,"saved":true,"user_id":"ZWME-2WKQ"}
 
 ---
 
-## 11. 坐标基准与身体碰撞箱（v1.4 / 服务 4.1.0）
+## 11. 坐标基准与身体碰撞箱（v1.4 / 服务 4.1.1）
 
 > 本节是**冻结契约**：客户端与服务端各自实现时必须逐字段对齐。改动先改这里。
 
@@ -516,7 +529,8 @@ S→C  OK | logout | {"authenticated":false,"saved":true,"user_id":"ZWME-2WKQ"}
   服务端对 `client_version < 0.2.0`（或空）的连接按旧语义处理——收到的 `state` 位置 **+1.65m** 换成头部再入库、
   下发时 **−1.65m** 换回脚底（这样旧客户端收发都是脚底坐标，往返一致）。
   客户端本次升级必须把 `project.godot` 的 `application/config/version` 提到 **0.2.0**，否则会被当成旧客户端。
-- `hello` 响应新增：`"coord_base":"head"`、`"hitboxes":true`、`"attack_cone_deg":60`。
+- `hello` 响应新增：`"coord_base":"head"`、`"hitboxes":true`、`"attack_cone_deg":60`、
+  `"aim_pitch":true`（服务端读懂 `state` 第 9 段 `pitch` 并按 3D 前向判命中，§11.3）。
 
 > **实现补充（服务端 `session.Session.coord_base`）**：
 > * `hello` 的 payload 允许显式声明基准：`hello | head` 或 `hello | coord_base=feet`，优先级高于 `client_version`；
@@ -549,21 +563,34 @@ S→C  OK | logout | {"authenticated":false,"saved":true,"user_id":"ZWME-2WKQ"}
 
 ### 11.3 命中判定（服务端权威）
 
-1. 原点 = **攻击者头部**；方向 = `normalize(目标头部 − 攻击者头部)`。
-2. 朝向校验：`dot(攻击者前向, 方向) ≥ cos(60°)`，否则 `FAIL | attack | NOT_FACING`（前向由攻击者 `yaw` 推出）。
+1. 原点 = **攻击者头部**；方向 = 攻击者 `yaw` 与 `pitch` 推出的 **3D 单位前向**：
+
+   ```
+   direction = (sin(yaw) * cos(pitch), sin(pitch), -cos(yaw) * cos(pitch))
+   ```
+
+   `yaw` 约定不变（0 = 正北 / −Z，顺时针为正）；`pitch` 单位度，`0` = 水平、**正数 = 抬头**
+   （来源：`state` 第 9 段，缺省 / 非法 = `0`，见 §4）。
+2. 朝向校验：`dot(3D 前向, normalize(目标头部 − 攻击者头部)) ≥ cos(ATTACK_CONE_DEG = 60°)`，
+   否则 `FAIL | attack | NOT_FACING`（**用同一条 3D 前向**，抬头 / 低头都会影响锥校验结果）。
 3. 把射线变换到目标局部系（先减目标头部、再绕 Y 轴反向旋转 `yaw`），对 11 个 AABB 做 slab 测试，取 `t` 最小且 `t ≤ ATTACK_RANGE(3m)` 的盒子。
 4. 全部不命中 → `FAIL | attack | MISS`（射程内没打中身体）。超出距离仍是 `OUT_OF_RANGE`。
 5. 命中盒子的倍率 × 基础伤害，写 `last_attacker`、按 §12 判红名。
 
-> **实现补充（射线方向，必须两边一致）**：第 1 条的"方向"若照字面取"朝目标头部"，
+> **实现补充（射线方向，必须两边一致）**：第 1 条的“方向”若照字面取“朝目标头部”，
 > 射线终点正好是 `head` 盒中心（半尺寸 0.10~0.11m），**任何射程内的攻击都会先命中头部盒**，
-> §11.2 的 11 个盒子、部位倍率与 `MISS` 全部不可达。服务端 `hitbox.resolve_hit` 因此：
+> §11.2 的 11 个盒子、部位倍率与 `MISS` 全部不可达。因此服务端 `hitbox.resolve_hit` 用
+> **攻击者朝向推出的 3D 前向**（4.1.1 起带 `pitch`，此前是水平前向）：
 >
-> * 射线方向 = **攻击者 `yaw` 推出的水平前向**（`+Y` 分量为 0，`yaw` 由攻击者最近一次 `state` 决定，服务端不再自动转向）；
+> * 射线方向 = `forward(yaw, pitch)`，`yaw` 由攻击者最近一次 `state` 决定，`pitch` 取同一次上报的第 9 段
+>   （只在内存里记住，**不落库**；缺省 / 非法 = `0`，等价于 4.1.0（无 pitch）的水平射线，旧客户端行为不变）；
 > * "目标头部 − 攻击者头部"只用于第 2 条的 60° 朝向锥校验；
-> * 于是等高的平射穿过 `head` 盒（命中头部 ×2），攻击者低 0.30m 的平射穿过 `torso` 盒（×1），
->   偏出身体轮廓则 `MISS`——这才能让 11 个盒子和倍率真正生效。
-> * 客户端做本地表现时请用同一规则（`yaw` 前向射线 + 目标局部系 11 盒 slab 测试），否则命中特效会和服务端伤害对不上。
+> * 等高平射（`pitch = 0`）穿过 `head` 盒（命中头部 ×2）；**低头**（`pitch < 0`）射线依次穿过
+>   `neck` / `torso` / `thigh` / `shin`；**抬头**（`pitch > 0`）射线从头顶越过 → `MISS`；
+> * 于是 11 个盒子的倍率、`MISS` 与“打头要瞄”的手感才真正生效——水平射线不再是永远爆头的作弊线。
+> * 客户端做本地表现时请用同一规则（`yaw` + 相机俯仰推出的 3D 前向射线 + 目标局部系 11 盒 slab 测试），
+>   否则命中特效会和服务端伤害对不上；客户端相机俯仰以 **抬头为正** 上报（Godot 里 `Head.rotation.x`
+>   正值即抬头，与协议同号）。
 > * `hit_t` 是命中处的射线距离（米，调试用），客户端可忽略。
 
 ### 11.4 `attack` 响应（新增字段）
@@ -577,6 +604,7 @@ OK | attack | {"ok":true,"target":"ZWME-2WKQ","part":"head","multiplier":2.0,"da
 - `damage` 已按部位倍率算好并取整到 0.1（头 50 / 颈 37.5 / 躯干 25 / 上臂 15 / 小臂 12.5 / 大腿 20 / 小腿 15）。
 - `killer_red` / `victim_red` 是**本次攻击之后**双方的红名标记（红名只在真死亡时变化，见 §12）。
 - `hit_t` 为命中点的射线距离（米），调试用，客户端可忽略。
+- 4.1.1 起命中方向带 `pitch`（§11.3），**响应字段与本节完全不变**（没有新增 `pitch` 回显）。
 - `revive` 不变（治疗不需要部位）。
 - `state` 响应新增自身 `"red": false`；`peers` 每行新增 `"red": false`、`"coord_base":"head"`（详见 §11.1）。
 

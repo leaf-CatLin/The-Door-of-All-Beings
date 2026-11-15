@@ -224,7 +224,8 @@ def handle_hello(req, session, ctx) -> bytes:
     * ``coord_base_applied``：**本连接**实际生效的基准。``client_version >= 0.2.0``
       （或在 hello 的 payload 里显式声明 ``head`` / ``coord_base=head``）时为 ``head``，
       否则按旧客户端的脚底语义给 ``feet``（服务端自动 ±1.65m 换算）；
-    * ``hitboxes`` / ``attack_cone_deg``：服务端按部位判定，11 个盒子见 §11.2，朝向锥 60°。
+    * ``hitboxes`` / ``attack_cone_deg``：服务端按部位判定，11 个盒子见 §11.2，朝向锥 60°；
+    * ``aim_pitch``：服务端读懂 ``state`` 第 9 段 ``pitch``、命中射线按 3D 前向判（§11.3，4.1.1 起）。
     """
     session.touch()
     if not session.session_token:
@@ -253,6 +254,8 @@ def handle_hello(req, session, ctx) -> bytes:
         "coord_base_applied": session.coord_base,
         "hitboxes": True,
         "attack_cone_deg": hitbox.ATTACK_CONE_DEG,
+        # 4.1.1：能力位——`state` 第 9 段 pitch 参与 3D 命中判定（§11.3）
+        "aim_pitch": True,
     })
 
 
@@ -543,9 +546,11 @@ def handle_whoami(req, session, ctx) -> bytes:
 def handle_state(req, session, ctx) -> bytes:
     """上报自身位置/状态。
 
-    payload：``<x>&<y>&<z>&<yaw>[&hp][&state][&stamina][&mana]``
+    payload：``<x>&<y>&<z>&<yaw>[&hp][&state][&stamina][&mana][&pitch]``
 
-    后四段都可省略（客户端不必每次都带三围）。
+    后五段都可省略（客户端不必每次都带三围）。第 9 段 ``pitch`` 是瞄准俯仰角
+    （度，0 = 水平、正 = 抬头，protocol.md §4 / §11.3）：缺省 / 空 / 非法一律按 0，
+    因此 8 段报文与旧客户端的行为完全不变；它只在内存里记住，不落库。
     ``state`` 在中间是为了与 v1.1 已有报文完全兼容。
 
     **坐标基准**（protocol.md §11.1）：``y`` 按本连接的基准解释——
@@ -560,9 +565,9 @@ def handle_state(req, session, ctx) -> bytes:
     if len(parts) < 4:
         return fail(
             "state", E_BAD_PAYLOAD,
-            "expect <x>&<y>&<z>&<yaw>[&hp][&state][&stamina][&mana]",
+            "expect <x>&<y>&<z>&<yaw>[&hp][&state][&stamina][&mana][&pitch]",
         )
-    parts += [""] * (8 - len(parts))
+    parts += [""] * (9 - len(parts))
 
     base = session.coord_base
     head_y = game.to_head_y(parts[1], base)
@@ -578,6 +583,7 @@ def handle_state(req, session, ctx) -> bytes:
         state=parts[5] or "idle",
         stamina=parts[6] or None,
         mana=parts[7] or None,
+        pitch=parts[8],          # 第 9 段：缺省 / 空串 → hitbox.norm_pitch 归 0
     )
     if row is None:
         return fail("state", E_BAD_PAYLOAD, "坐标非法")

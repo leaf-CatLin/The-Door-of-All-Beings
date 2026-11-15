@@ -38,6 +38,8 @@ players 元素结构（对应表 player）
   "pos_x": 12.5, "pos_y": 1.65, "pos_z": -8.0, "yaw": 180.0,
                           # **头部中心的世界坐标**（protocol.md §11.1）：
                           # 脚底 = pos_y - HEAD_OFFSET_Y(1.65)
+  "pitch": 0.0,           # 瞄准俯仰角（度，0 = 水平，正 = 抬头；protocol.md §4 第 9 段）。
+                          # **只在内存里**：不落库、不进 peers，只给攻击方向用（§11.3）
   "coord_base": "head",    # 这一行的坐标基准（内存里恒为 head；
                           # 库里旧行是 'feet'，加载时一次性 +1.65 迁移）
   "state": "moving",       # idle / moving / dead
@@ -566,6 +568,8 @@ def _new_player_row(
         "pos_y": 0.0,
         "pos_z": 0.0,
         "yaw": 0.0,
+        # 瞄准俯仰角（§4 第 9 段）：0 = 水平，正 = 抬头。只在内存里，不落库。
+        "pitch": 0.0,
         "state": "idle",
         "online": True,
         # 从当前全局修订号起算：下线后销毁了缓存行、重连重建时，
@@ -603,8 +607,14 @@ def set_player_state(
     state: str = "idle",
     stamina=None,
     mana=None,
+    pitch=0.0,
 ) -> dict | None:
-    """写入一名玩家的最新状态（坐标非法返回 None）。每次写入 rev + 1。"""
+    """写入一名玩家的最新状态（坐标非法返回 None）。每次写入 rev + 1。
+
+    ``pitch`` 是瞄准俯仰角（§4 第 9 段，度，0 = 水平、正 = 抬头）。它**只在内存里**，
+    不落库、不进 ``peers``，只用于攻击方向与朝向锥（§11.3）。
+    非法值 / 缺省由 :func:`hitbox.norm_pitch` 归成 0。
+    """
     if not user_id:
         return None
     pos = [_coord(pos_x), _coord(pos_y), _coord(pos_z)]
@@ -628,6 +638,7 @@ def set_player_state(
         if not _is_dying(row) and not _is_spectating(row, now):
             row["pos_x"], row["pos_y"], row["pos_z"] = pos[0], pos[1], pos[2]
             row["yaw"] = _norm_yaw(yaw)
+            row["pitch"] = hitbox.norm_pitch(pitch)
             row["state"] = state if state in PLAYER_STATES else "idle"
             _apply_stat(row, "stamina", stamina)
             _apply_stat(row, "mana", mana)
@@ -678,6 +689,8 @@ def _normalize_player_row(row: dict) -> dict | None:
         "pos_y": pos_y,
         "pos_z": _num(row.get("pos_z")),
         "yaw": _norm_yaw(row.get("yaw")),
+        # 库里的 player 表没有 pitch 列：重载时一律回水平（内存态，不落库）。
+        "pitch": 0.0,
         "coord_base": COORD_BASE_HEAD,
         "state": str(row.get("state") or "idle"),
         "online": False,           # 重启后/重载时没人在线
@@ -893,8 +906,9 @@ def attack(attacker_id: str, target_id: str, now: float | None = None) -> dict:
 
     命中判定见 ``hitbox``（protocol.md §11.2 / §11.3）：
 
-    * 原点 = 攻击者**头部**；方向 = 攻击者 ``yaw`` 推出的水平前向；
-    * 60° 朝向锥不过 → ``NOT_FACING``；射程内没打到任何盒子 → ``MISS``；
+    * 原点 = 攻击者**头部**；方向 = 攻击者 ``yaw`` + ``pitch`` 推出的 **3D 前向**
+      （``pitch`` = 最近一次 ``state`` 的第 9 段，缺省 0 即水平）；
+    * 60° 朝向锥用同一条 3D 前向校验，不过 → ``NOT_FACING``；射程内没打到任何盒子 → ``MISS``；
     * 命中部位伤害 = ``ATTACK_DAMAGE(25) × 倍率``（头 50 / 颈 37.5 / 躯干 25 …）。
 
     返回 ``{"ok": True, ...}`` 或 ``{"ok": False, "error": ..., "code": ...}``。
@@ -940,6 +954,8 @@ def attack(attacker_id: str, target_id: str, now: float | None = None) -> dict:
             }
 
         attacker_yaw = _norm_yaw(attacker.get("yaw"))
+        # 瞄准俯仰角（§4 第 9 段）：0 = 水平、正 = 抬头；缺省 / 非法一律 0（旧行为不变）
+        attacker_pitch = hitbox.norm_pitch(attacker.get("pitch"))
         attacker_head = (
             _num(attacker.get("pos_x")), _num(attacker.get("pos_y")),
             _num(attacker.get("pos_z")),
@@ -948,8 +964,8 @@ def attack(attacker_id: str, target_id: str, now: float | None = None) -> dict:
             _num(target.get("pos_x")), _num(target.get("pos_y")),
             _num(target.get("pos_z")),
         )
-        # 朝向锥：目标必须在大致前方（§11.3 第 2 条）
-        if not hitbox.facing_ok(attacker_yaw, attacker_head, target_head):
+        # 朝向锥：目标必须在大致前方（§11.3 第 2 条，用与射线相同的 3D 前向）
+        if not hitbox.facing_ok(attacker_yaw, attacker_head, target_head, attacker_pitch=attacker_pitch):
             return {
                 "ok": False, "error": "目标不在攻击朝向内",
                 "code": "NOT_FACING", "distance": round(dist, 2),
@@ -965,6 +981,7 @@ def attack(attacker_id: str, target_id: str, now: float | None = None) -> dict:
         hit = hitbox.resolve_hit(
             attacker_head, attacker_yaw, target_head,
             _norm_yaw(target.get("yaw")), ATTACK_RANGE,
+            attacker_pitch=attacker_pitch,
         )
         if hit is None:
             bump_players_rev()      # attack_at / rev 已变，通知拉取方

@@ -43,7 +43,8 @@ from dotenv import load_dotenv
 ## 协议版本：报文第一行的 version 字段
 PROTOCOL_VERSION = "1.4"
 ## 服务端软件版本：随发布递增，客户端可据此提示更新
-SERVICE_VERSION = "4.1.0"
+## 4.1.1：`state` 第 9 段 pitch（瞄准俯仰）参与 3D 命中判定（协议仍是 1.4，纯追加可选字段）。
+SERVICE_VERSION = "4.1.1"
 
 ## 服务器资源目录默认值（POSIX 路径；本地 Windows 创建失败只告警）
 ASSETS_DIR_DEFAULT = "/home/mimi/obj/assets/The-Doors-of-Bings"
