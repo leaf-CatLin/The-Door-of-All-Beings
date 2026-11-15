@@ -25,7 +25,21 @@ const NetConfig = preload("res://code/net/net_config.gd")
 const AccountStore = preload("res://code/StartCreen/account_store.gd")
 
 ## HTTP 发现请求超时（秒）。
-const DISCOVER_TIMEOUT := 6.0
+## 冷启动第一发 TLS 握手偶尔会慢（主线程正在载启动动画），给足余量；
+## 真正的兜底是下面的重试与「失败不阻塞」的回退直连。
+const DISCOVER_TIMEOUT := 8.0
+## 发现请求最多尝试几次（含首次）。实测冷启动首次约 1/3 概率立即 `RESULT_TIMEOUT(13)`，
+## 隔一小会儿重发几乎必成，所以重试比回退直连（白等 6s）划算得多。
+const DISCOVER_MAX_ATTEMPT := 2
+## 两次发现尝试之间的间隔（秒）。
+const DISCOVER_RETRY_DELAY := 0.5
+
+## 进程级发现结果缓存（静态成员本就只有一份，但显式声明意图）。
+## 为什么需要：`userDOM`（登录页）与 `race`（种族页）各自 `new()` 一个 GameApi，
+## 两个实例会在启动后几秒内**各发一次**发现请求；冷启动时两个 TLS 握手挤在一起，
+## Godot 的 HTTPRequest 会偶发 `RESULT_TIMEOUT(13)`（实测 3 次里 2 次失败），
+## 然后白白回退直连。缓存让第二个实例直接复用第一个的结果，省掉一次握手与 6 秒等待。
+static var _discover_cache: Dictionary = {}
 
 ## 坐标基准（§11.1）：协议里所有位置字段都是**头部中心**。
 const COORD_BASE_HEAD := "head"
@@ -283,8 +297,36 @@ func _login_no_retry(login_user_id: String, device: String) -> Dictionary:
 
 ## HTTP 发现：GET NetConfig.endpoint_url()（机器A），解析出 TCP 游戏服地址（机器B）。
 ## 成功 {ok:true, host, port, ...}；失败 {ok:false, error}。发现只走 HTTP，不参与后续 TCP 报文。
+##
+## 两层保护（实测：冷启动首次 TLS 握手约 1/3 概率立即返回 `RESULT_TIMEOUT(13)`，
+## 而重试几乎必成。失败重试的总代价只有几十毫秒，远小于回退直连要白等满 6 秒）：
+##   1. **进程级缓存**：userDOM 与 race 各 new 一个 GameApi，第二个实例直接复用结果；
+##   2. **失败重试**：单次失败后隔 `DISCOVER_RETRY_DELAY` 秒重发，最多 `DISCOVER_MAX_ATTEMPT` 次。
+## 注意：重试期间只允许一次请求在飞（串行），避免多个 TLS 握手互相干扰。
 func _discover_tcp_endpoint() -> Dictionary:
 	var url := NetConfig.endpoint_url()
+	var cached: Variant = _discover_cache.get(url, null)
+	if typeof(cached) == TYPE_DICTIONARY and bool((cached as Dictionary).get("ok", false)):
+		return (cached as Dictionary).duplicate(true)
+
+	# 串行重试：一次失败只重发，不并发（并发 TLS 正是抖动的来源之一）。
+	var last: Dictionary = {"ok": false, "error": "未发起"}
+	for attempt in range(DISCOVER_MAX_ATTEMPT):
+		last = await _discover_once(url)
+		if bool(last.get("ok", false)):
+			# 成功一次就记住：同进程的另一个 GameApi 实例直接复用，不再重复握手。
+			_discover_cache[url] = last.duplicate(true)
+			return last
+		if attempt < DISCOVER_MAX_ATTEMPT - 1:
+			print("发现接口第 %d 次失败（%s），%.1f 秒后重试" % [
+				attempt + 1, str(last.get("error", "")), DISCOVER_RETRY_DELAY,
+			])
+			await get_tree().create_timer(DISCOVER_RETRY_DELAY).timeout
+	return last
+
+
+## 发一次发现请求（不做缓存与重试）。成功 {ok:true, host, port, ...}，失败 {ok:false, error}。
+func _discover_once(url: String) -> Dictionary:
 	var req := HTTPRequest.new()
 	req.timeout = DISCOVER_TIMEOUT
 	add_child(req)
@@ -329,11 +371,14 @@ func _discover_tcp_endpoint() -> Dictionary:
 		port = int(data.get("port", 0))
 	if host == "" or port <= 0:
 		return {"ok": false, "error": "发现响应缺少合法的 tcp host/port"}
-	return {
+	var result := {
 		"ok": true, "host": host, "port": port,
 		"service_version": str(data.get("service_version", "")),
 		"protocol_version": str(data.get("protocol_version", "")),
 	}
+	# 成功一次就记住：同进程的另一个 GameApi 实例（userDOM / race）直接复用，不再重复握手。
+	_discover_cache[url] = result.duplicate(true)
+	return result
 
 
 ## 响应里回显的 `session_token` 存一份（reset 后靠它取回可用值）。
