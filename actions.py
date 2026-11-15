@@ -24,6 +24,7 @@ from typing import Callable
 import config
 import device_id as devid
 import game
+import hitbox
 import protocol
 import users as users_mod
 from protocol import (
@@ -216,10 +217,26 @@ def handle_hello(req, session, ctx) -> bytes:
     v1.3 取消了建连时的 ``PUSH | token``，改为在首个响应（hello）里把 token 带回去，
     因此客户端第一条 hello 可以不带 token（按 2 段报文发），拿到后后续请求都带上。
     ``push_hz`` 固定为 0：服务端不再主动推送，询问频率由客户端自定。
+
+    v1.4 追加（protocol.md §11.1）：
+
+    * ``coord_base``：协议规定的坐标基准，恒为 ``head``（所有玩家位置字段都是**头部中心**）；
+    * ``coord_base_applied``：**本连接**实际生效的基准。``client_version >= 0.2.0``
+      （或在 hello 的 payload 里显式声明 ``head`` / ``coord_base=head``）时为 ``head``，
+      否则按旧客户端的脚底语义给 ``feet``（服务端自动 ±1.65m 换算）；
+    * ``hitboxes`` / ``attack_cone_deg``：服务端按部位判定，11 个盒子见 §11.2，朝向锥 60°。
     """
     session.touch()
     if not session.session_token:
         session.issue_token()
+
+    # 允许客户端在 hello 里显式声明坐标基准（缺省按请求头的 client_version 自动判定）
+    declared = req.action_data.strip().lower()
+    if declared.startswith("coord_base="):
+        declared = declared.split("=", 1)[1].strip()
+    if declared in (game.COORD_BASE_HEAD, game.COORD_BASE_FEET):
+        session.coord_base_override = declared
+
     return ok("hello", {
         "magic": protocol.MAGIC,
         **_version_block(),
@@ -231,6 +248,11 @@ def handle_hello(req, session, ctx) -> bytes:
         "session_token": session.session_token,
         "actions": sorted(ACTIONS.keys()),
         "now": int(time.time()),
+        # v1.4：坐标基准与身体碰撞箱（protocol.md §11）
+        "coord_base": game.COORD_BASE_HEAD,
+        "coord_base_applied": session.coord_base,
+        "hitboxes": True,
+        "attack_cone_deg": hitbox.ATTACK_CONE_DEG,
     })
 
 
@@ -447,9 +469,11 @@ def handle_login(req, session, ctx) -> bytes:
         "player_id": prow.get("player_id") or info["user_id"],
         "player_name": prow.get("player_name", info["user_name"]),
         "race": prow.get("race", game.DEFAULT_RACE),
+        # 坐标一律头部中心（§11.1）；旧客户端（< 0.2.0）下发时自动减 1.65m 回脚底
         "pos_x": prow.get("pos_x", 0.0),
-        "pos_y": prow.get("pos_y", 0.0),
+        "pos_y": game.from_head_y(prow.get("pos_y", 0.0), session.coord_base),
         "pos_z": prow.get("pos_z", 0.0),
+        "coord_base": session.coord_base,
         "yaw": prow.get("yaw", 0.0),
         "server_push": False,
         "push_hz": 0,
@@ -523,6 +547,10 @@ def handle_state(req, session, ctx) -> bytes:
 
     后四段都可省略（客户端不必每次都带三围）。
     ``state`` 在中间是为了与 v1.1 已有报文完全兼容。
+
+    **坐标基准**（protocol.md §11.1）：``y`` 按本连接的基准解释——
+    v0.2.0 及以上是**头部中心**，更老的客户端是**脚底**，服务端在这里 +1.65m
+    换算成头部再入库（响应里的 ``pos_*`` 再换算回该客户端的基准）。
     """
     need = _require_auth(req, session)
     if need is not None:
@@ -536,11 +564,16 @@ def handle_state(req, session, ctx) -> bytes:
         )
     parts += [""] * (8 - len(parts))
 
+    base = session.coord_base
+    head_y = game.to_head_y(parts[1], base)
+    if head_y is None:
+        return fail("state", E_BAD_PAYLOAD, "坐标非法")
+
     row = game.set_player_state(
         session.user_id,
         session.user_name,
         session.device_id_hex,
-        parts[0], parts[1], parts[2], parts[3],
+        parts[0], head_y, parts[2], parts[3],
         hp=parts[4] or None,
         state=parts[5] or "idle",
         stamina=parts[6] or None,
@@ -549,12 +582,12 @@ def handle_state(req, session, ctx) -> bytes:
     if row is None:
         return fail("state", E_BAD_PAYLOAD, "坐标非法")
     session.touch()
-    mine = game.self_payload(session.user_id) or {}
+    mine = game.self_payload(session.user_id, base) or {}
     return ok("state", {
         "t": int(row["updated_at"]),
         "seq": game.revisions()[1],
         "rev": int(row.get("rev", 0)),
-        # 权威状态：HP / 灵力 / 等级 / 濒死 / 旁观（客户端只读）
+        # 权威状态：HP / 灵力 / 等级 / 濒死 / 旁观 / 红名（客户端只读）
         "hp": mine.get("hp", row.get("hp")),
         "hp_max": mine.get("hp_max", row.get("hp_max")),
         "spirit": mine.get("spirit", row.get("spirit")),
@@ -565,25 +598,33 @@ def handle_state(req, session, ctx) -> bytes:
         "dying_remaining": mine.get("dying_remaining", 0.0),
         "spectating": mine.get("spectating", False),
         "spectator_remaining": mine.get("spectator_remaining", 0.0),
+        "red": mine.get("red", False),
         # 服务端冻结的坐标 = 死亡点 / 复活点（旁观结束时客户端据此回位）
         "pos_x": mine.get("pos_x", row.get("pos_x", 0.0)),
-        "pos_y": mine.get("pos_y", row.get("pos_y", 0.0)),
+        "pos_y": mine.get("pos_y", game.from_head_y(row.get("pos_y", 0.0), base)),
         "pos_z": mine.get("pos_z", row.get("pos_z", 0.0)),
         "yaw": mine.get("yaw", row.get("yaw", 0.0)),
+        "coord_base": base,
     })
 
 
 @action("peers")
 def handle_peers(req, session, ctx) -> bytes:
-    """拉一次在线玩家快照（与 PUSH world 同结构）。"""
+    """拉一次在线玩家快照（与 PUSH world 同结构）。
+
+    v1.4：每行新增 ``red``（红名）与 ``coord_base``（该行坐标的基准，§11.4）；
+    坐标按本连接的基准下发（旧客户端自动转回脚底）。
+    """
     need = _require_auth(req, session)
     if need is not None:
         return need
     world_rev, players_rev = game.revisions()
+    base = session.coord_base
     return ok("peers", {
-        "players": game.players_payload(),
+        "players": game.players_payload(coord_base=base),
         "players_rev": players_rev,
         "world_rev": world_rev,
+        "coord_base": base,
         "t": int(time.time()),
     })
 
@@ -648,7 +689,12 @@ def handle_races(req, session, ctx) -> bytes:
 
 @action("attack")
 def handle_attack(req, session, ctx) -> bytes:
-    """近战攻击。payload: ``<target_user_id>``。"""
+    """近战攻击。payload: ``<target_user_id>``。
+
+    服务端权威判定（protocol.md §11.3 / §11.4）：射程 3m、朝向锥 60°、
+    部位命中（头部 ×2 / 颈部 ×1.5 / 躯干 ×1 …）、伤害 = 25 × 倍率。
+    错误码：``OUT_OF_RANGE`` / ``NOT_FACING`` / ``MISS``（其余沿用 ``BAD_PAYLOAD``）。
+    """
     need = _require_auth(req, session)
     if need is not None:
         return need
@@ -658,7 +704,8 @@ def handle_attack(req, session, ctx) -> bytes:
         return fail("attack", E_BAD_PAYLOAD, "缺少目标 player_id")
     result = game.attack(session.user_id, target)
     if not result.get("ok"):
-        return fail("attack", E_BAD_PAYLOAD, str(result.get("error") or "攻击失败"))
+        code = str(result.get("code") or E_BAD_PAYLOAD)
+        return fail("attack", code, str(result.get("error") or "攻击失败"))
     session.touch()
     return ok("attack", result)
 

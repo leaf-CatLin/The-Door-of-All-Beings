@@ -1,4 +1,4 @@
-"""TCP 协议冒烟测试（v1.3：无主动推送 + 头/正文联合哈希 + 批量多 action）。
+"""TCP 协议冒烟测试（v1.4：联合哈希 + 批量多 action + 部位命中 + 红名 + 坐标基准）。
 
 用法::
 
@@ -13,7 +13,10 @@
    批量多 action（一次请求多个动作，按序多帧返回）/ 设备签发与确认 / 名称查重 /
    注册 / 登录（含 file_hash）/ 重放 / 时间戳过期 / 未知动作 / 设备伪造 /
    拉取式 peers & world（不再有 10Hz PUSH）/ 双客户端同屏 / 正常下线完整拆除 /
-   意外断开宽限期与超时销毁（无 leave 广播，靠 peers 拉取感知）。
+   意外断开宽限期与超时销毁（无 leave 广播，靠 peers 拉取感知）/
+   **v1.4 新增**：身体碰撞箱部位命中（头部 50 / 躯干 25）/ MISS / NOT_FACING /
+   OUT_OF_RANGE / 真死亡后击杀者变红 / 死亡清红名 / legacy(0.1.0) 脚底坐标换算 /
+   coord_base='feet' 旧行的一次性迁移。
 
 退出码 0 = 全绿。
 """
@@ -100,15 +103,19 @@ class Client:
     v1.3：服务端建连后**不再推送任何帧**，会话 Token 随首个 ``hello`` 响应下发；
     因此构造时不做任何等待，``hello()`` 会把响应里的 ``session_token`` 记下来，
     后续请求自动携带（想测匿名可用 ``call(..., session_token="")``）。
+
+    ``client_version`` 决定服务端按哪种坐标基准理解本连接（protocol.md §11.1）：
+    默认 ``0.2.0``（头部基准）；测旧客户端时传 ``0.1.0``。
     """
 
-    def __init__(self, host: str, port: int) -> None:
+    def __init__(self, host: str, port: int, client_version: str = "0.2.0") -> None:
         self.sock = socket.create_connection((host, port), timeout=5.0)
         self.sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._buf = b""
         self.device_id = ""
         self.user_id = ""
         self.token = ""
+        self.client_version = client_version
 
     # -- 低层 ---------------------------------------------------------
     def send_raw(self, data: bytes) -> None:
@@ -173,6 +180,7 @@ class Client:
         tok = self.token if session_token is None else session_token
         if raw_device_id is not None:
             dev = raw_device_id
+        kw.setdefault("client_version", self.client_version)
         packet = protocol.build_request(action, data, dev, usr, session_token=tok, **kw)
         self.send_raw(packet)
         return self.read_frame()
@@ -190,6 +198,7 @@ class Client:
         dev = self.device_id if device is None else device
         usr = self.user_id if user is None else user
         tok = self.token if session_token is None else session_token
+        kw.setdefault("client_version", self.client_version)
         packet = protocol.build_request(
             "", "", dev, usr, session_token=tok, calls=calls, **kw
         )
@@ -252,7 +261,7 @@ def run(verbose: bool = False) -> int:
     service.s2_warmup()
     service.s3_start()
     host, port = service.server.bind()  # 幂等，只为拿到真实端口（cfg 里是 0）
-    print(f"服务端已启动 tcp://{host}:{port}（backend=memory, v1.3 无推送）")
+    print(f"服务端已启动 tcp://{host}:{port}（backend=memory, v1.4 无推送）")
 
     a = Client(host, port)
     b = Client(host, port)
@@ -274,6 +283,17 @@ def run(verbose: bool = False) -> int:
                 t.check(wanted in actions, f"动作表包含 {wanted}")
         r = b.hello()
         t.check(a.token != b.token, "两条连接的 token 应不同")
+
+        t.case("v1.4 hello：坐标基准 / 碰撞箱 / 朝向锥")
+        r = a.hello()
+        t.check(r is not None and r.ok, "hello 应 OK")
+        if r is not None and r.ok:
+            t.eq(r.data.get("protocol_version"), "1.4", "协议版本升到 1.4")
+            t.eq(r.data.get("server_version"), "4.1.0", "服务版本 4.1.0")
+            t.eq(r.data.get("coord_base"), "head", "协议坐标基准 = 头部")
+            t.eq(r.data.get("coord_base_applied"), "head", "0.2.0 客户端实际按 head")
+            t.eq(r.data.get("hitboxes"), True, "服务端启用身体碰撞箱")
+            t.eq(r.data.get("attack_cone_deg"), 60, "攻击朝向锥 60°")
 
         t.case("联合哈希：篡改请求头会让哈希失效")
         pkt = protocol.build_request("ping", session_token=a.token)
@@ -493,6 +513,48 @@ def run(verbose: bool = False) -> int:
             t.eq(r.code, protocol.E_BAD_USER_ID, "错误码")
 
         # ------------------------------------------------------------------
+        t.case("legacy 0.1.0 客户端：脚底坐标自动 ±1.65m 换算")
+        c = Client(host, port, client_version="0.1.0")
+        extra.append(c)
+        r = c.hello()
+        t.check(r is not None and r.ok, "hello 应 OK")
+        if r is not None and r.ok:
+            t.eq(r.data.get("coord_base"), "head", "协议基准恒为 head")
+            t.eq(r.data.get("coord_base_applied"), "feet", "旧客户端实际按 feet 处理")
+        r = c.call("device", "")
+        c.device_id = (r.data or {}).get("device_id", "") if r is not None else ""
+        r = c.call("register", "老客户端")
+        t.check(r is not None and r.ok, "注册应 OK")
+        if r is not None and r.ok:
+            c.user_id = r.data.get("user_id", "")
+        r = c.call("state", "0&0&5&0")            # 旧语义：y=0 是脚底
+        t.check(r is not None and r.ok, "老客户端 state 应 OK")
+        crow = game.get_player(c.user_id) or {}
+        t.check(
+            abs(float(crow.get("pos_y", 0.0)) - 1.65) < 1e-6,
+            f"入库时 +1.65m 换成头部 got={crow.get('pos_y')}",
+        )
+        if r is not None and r.ok:
+            t.eq(r.data.get("pos_y"), 0.0, "state 响应按脚底基准下发")
+            t.eq(r.data.get("coord_base"), "feet", "state 响应标记 feet")
+        r = c.call("peers")
+        mine = [p for p in ((r.data or {}).get("players") or [])
+                if p.get("user_id") == c.user_id]
+        t.check(bool(mine) and mine[0].get("coord_base") == "feet", "旧客户端 peers 行标记 feet")
+        t.check(
+            bool(mine) and abs(float(mine[0].get("pos_y", 0.0))) < 1e-6,
+            f"旧客户端 peers y 换回脚底 got={mine[0].get('pos_y') if mine else None}",
+        )
+        r = a.call("peers")
+        modern = [p for p in ((r.data or {}).get("players") or [])
+                  if p.get("user_id") == c.user_id]
+        t.check(
+            bool(modern) and abs(float(modern[0].get("pos_y", 0.0)) - 1.65) < 1e-6,
+            f"新客户端看到头部坐标 got={modern[0].get('pos_y') if modern else None}",
+        )
+        t.check(bool(modern) and modern[0].get("coord_base") == "head", "新客户端 peers 行标记 head")
+
+        # ------------------------------------------------------------------
         t.case("races 由服务端下发（开发阶段仅人类）")
         r = a.call("races", "")
         t.check(r is not None and r.ok, "races 应 OK")
@@ -522,18 +584,77 @@ def run(verbose: bool = False) -> int:
         r = a.call("assets", "get&../secret.txt")
         t.check(r is not None and not r.ok, "路径穿越必须被拒绝")
 
+        t.case("attack 部位命中：头部 ×2（50） / 躯干 ×1（25）")
+        r = a.call("state", "0&1.65&0&0")          # a 头部 (0,1.65,0)，yaw 0 = 正北/−Z
+        t.check(r is not None and r.ok, "a 上报位置")
+        r = b.call("state", "0&1.65&-2&180")       # b 头部在 a 正前方 2m
+        t.check(r is not None and r.ok, "b 上报位置")
+        time.sleep(0.08)
+        r = a.call("attack", b.user_id)
+        t.check(r is not None and r.ok, f"等高平射应命中 got={r}")
+        if r is not None and r.ok:
+            t.eq(r.data.get("target"), b.user_id, "target")
+            t.eq(r.data.get("part"), "head", "等高平射先命中头部盒")
+            t.eq(r.data.get("multiplier"), 2.0, "头部倍率 2.0")
+            t.eq(r.data.get("damage"), 50.0, "头部伤害 = 25 × 2 = 50")
+            t.eq(r.data.get("hp"), 50.0, "目标 HP 100 - 50")
+            t.eq(r.data.get("hp_max"), 100.0, "目标 HP 上限")
+            t.eq(r.data.get("dying"), False, "还没进濒死")
+            t.eq(r.data.get("distance"), 2.0, "距离 2m")
+            t.eq(r.data.get("killer_red"), False, "击杀者初始不红")
+            t.eq(r.data.get("victim_red"), False, "受害者初始不红")
+        time.sleep(0.08)
+        r = a.call("state", "0&1.35&0&0")          # 攻击者头部低 0.30m → 平射打在躯干高度
+        t.check(r is not None and r.ok, "a 下移后上报")
+        time.sleep(0.08)
+        r = a.call("attack", b.user_id)
+        t.check(r is not None and r.ok, f"低位平射应命中躯干 got={r}")
+        if r is not None and r.ok:
+            t.eq(r.data.get("part"), "torso", "低 0.30m 平射命中躯干盒")
+            t.eq(r.data.get("multiplier"), 1.0, "躯干倍率 1.0")
+            t.eq(r.data.get("damage"), 25.0, "躯干伤害 = 25 × 1 = 25")
+            t.eq(r.data.get("hp"), 25.0, "目标 HP 50 - 25")
+
+        t.case("attack 三种失败：MISS / NOT_FACING / OUT_OF_RANGE")
+        r = a.call("state", "0&1.65&0&20")          # 偏 20°：仍在 60° 锥内但打空
+        t.check(r is not None and r.ok, "a 偏转 20° 上报")
+        time.sleep(0.08)
+        r = a.call("attack", b.user_id)
+        t.check(r is not None and r.kind == "FAIL", f"偏 20° 平射应打空 got={r}")
+        if r is not None:
+            t.eq(r.code, protocol.E_MISS, "MISS")
+        time.sleep(0.08)
+        r = a.call("state", "0&1.65&0&90")          # 偏 90°：出朝向锥
+        t.check(r is not None and r.ok, "a 偏转 90° 上报")
+        time.sleep(0.08)
+        r = a.call("attack", b.user_id)
+        t.check(r is not None and r.kind == "FAIL", f"背对目标应被拒 got={r}")
+        if r is not None:
+            t.eq(r.code, protocol.E_NOT_FACING, "NOT_FACING")
+        r = b.call("state", "0&1.65&-5&180")        # 拉开到 5m：超出射程
+        t.check(r is not None and r.ok, "b 后撤上报")
+        r = a.call("state", "0&1.65&0&0")
+        time.sleep(0.08)
+        r = a.call("attack", b.user_id)
+        t.check(r is not None and r.kind == "FAIL", f"超距应被拒 got={r}")
+        if r is not None:
+            t.eq(r.code, protocol.E_OUT_OF_RANGE, "OUT_OF_RANGE")
+        r = b.call("state", "0&1.65&-2&180")        # 回到 2m，供濒死流程用
+        t.check(r is not None and r.ok, "b 回到 2m")
+
         t.case("攻击 → 濒死 → 复活（5 秒窗口内救回）")
-        a.call("state", "0&0&0&0")
-        b.call("state", "0&0&0&0")
         with game.mutate():
             brow = game.players[b.user_id]
+            brow["hp"] = 100.0
             brow["spirit"] = 4.0
             brow["rev"] = int(brow.get("rev", 0)) + 1
+        r = a.call("state", "0&1.35&0&0")           # 躯干命中 25 伤害/次，4 次打空 100 HP
+        t.check(r is not None and r.ok, "a 回到低位")
         for _ in range(4):
             r = a.call("attack", b.user_id)
             t.check(r is not None and r.ok, "攻击应 OK")
             time.sleep(0.08)
-        r = b.call("state", "0&0&0&0")
+        r = b.call("state", "0&1.65&-2&180")
         t.check(r is not None and r.ok, "濒死者仍可上报（坐标被冻结）")
         if r is not None and r.ok:
             t.eq(r.data.get("hp"), 0.0, "HP 归零")
@@ -542,8 +663,26 @@ def run(verbose: bool = False) -> int:
         t.check(r is not None and r.ok, f"5 秒内复活应成功 got={r}")
         if r is not None and r.ok:
             t.eq(r.data.get("hp"), 30.0, "复活后回到 30% 生命")
-        r = b.call("state", "0&0&0&0")
+        r = b.call("state", "0&1.65&-2&180")
         t.check(r is not None and r.ok and r.data.get("dying") is False, "濒死状态已解除")
+
+        t.case("红名可见：state.red / peers 每行 red + coord_base")
+        with game.mutate():
+            brow = game.players[b.user_id]
+            brow["red_name"] = True                  # 模拟“已经是红名”的玩家
+            brow["red_at"] = time.time()
+            brow["rev"] = int(brow.get("rev", 0)) + 1
+        r = b.call("state", "0&1.65&-2&180")
+        t.check(r is not None and r.ok, "红名玩家 state 应 OK")
+        if r is not None and r.ok:
+            t.eq(r.data.get("red"), True, "state 响应带 red=True")
+        r = a.call("peers")
+        line = [p for p in ((r.data or {}).get("players") or [])
+                if p.get("user_id") == b.user_id]
+        t.check(bool(line) and line[0].get("red") is True, "peers 行带 red=True")
+        t.check(bool(line) and line[0].get("coord_base") == "head", "peers 行带 coord_base=head")
+        r = a.call("state", "0&1.65&0&0")
+        t.check(r is not None and r.ok and r.data.get("red") is False, "自己不是红名")
 
         t.case("濒死不救 → 确认死亡 → 灵力转移 → 旁观 → 清空复活")
         for _ in range(4):
@@ -557,9 +696,19 @@ def run(verbose: bool = False) -> int:
         t.eq(arow.get("kills"), 1, "击杀数 +1")
         t.eq(arow.get("level"), 2, "灵力 2 触发升级（本级消耗 2）")
         t.eq(arow.get("spirit"), 0.0, "升级消耗后灵力归零")
+        t.eq(arow.get("red_name"), True, "真死亡那一刻击杀者变红（§12.1 时点）")
+        t.check(arow.get("red_at") is not None, "red_at 已记录变红时间")
         brow = game.get_player(b.user_id) or {}
         t.check(brow.get("spectator_until") is not None, "进入 30 分钟旁观（测试压缩）")
         t.eq(brow.get("deaths"), 1, "死亡数 +1")
+        t.eq(brow.get("red_name"), False, "确认死亡 → 受害者清红名（§12.4）")
+        r = a.call("state", "0&1.65&0&0")
+        t.check(r is not None and r.ok and r.data.get("red") is True,
+                "state 响应回写自己的红名")
+        r = a.call("peers")
+        mine_red = [p for p in ((r.data or {}).get("players") or [])
+                    if p.get("user_id") == a.user_id]
+        t.check(bool(mine_red) and mine_red[0].get("red") is True, "peers 里他人能看到红名")
 
         time.sleep(game.SPECTATOR_SECONDS + 1.2)   # 等旁观结束
         r = a.call("peers")
@@ -660,6 +809,51 @@ def run(verbose: bool = False) -> int:
         t.check(stats["packets"] > 0, f"packets={stats['packets']}")
         t.check(stats["rejected"] > 0, f"rejected={stats['rejected']}")
         t.check(stats["online_players"] >= 1, f"online_players={stats['online_players']}")
+
+        # ------------------------------------------------------------------
+        # 放在最后：这会清空内存热缓存并从另一份 store 重新载入
+        t.case("coord_base 迁移：库里的 feet 旧行加载时 +1.65m 并改写为 head")
+        import store as store_mod
+
+        scratch = store_mod.MemoryStore()
+        scratch.save_players([{
+            "user_id": "MIGR-0001",
+            "player_name": "旧档",
+            "race": "human",
+            "pos_x": 1.0, "pos_y": 0.0, "pos_z": 2.0, "yaw": 0.0,
+            "state": "idle", "online": False,
+            "hp_max": 100.0, "hp": 100.0,
+            "stamina_max": 100.0, "stamina": 100.0,
+            "mana_max": 100.0, "mana": 100.0,
+            "spirit": 0.0, "level": 1, "spirit_at": 0.0,
+            "death_at": None, "spectator_until": None, "last_attacker": "",
+            "inventory": {}, "kills": 0, "deaths": 0,
+            "red_name": False, "red_at": None,
+            "coord_base": "feet",          # 老库里的行：脚底基准
+            "rev": 1,
+        }])
+        t.check(game.load_from_store(scratch), "load_from_store 应成功")
+        row = game.get_player("MIGR-0001") or {}
+        t.check(
+            abs(float(row.get("pos_y", 0.0)) - 1.65) < 1e-6,
+            f"加载时 y 由 0 变 1.65 got={row.get('pos_y')}",
+        )
+        t.eq(row.get("coord_base"), "head", "内存行已改写为 head")
+        game.save(scratch)
+        back = scratch.load_player("MIGR-0001") or {}
+        t.eq(back.get("coord_base"), "head", "落库后库里也是 head")
+        t.check(
+            abs(float(back.get("pos_y", 0.0)) - 1.65) < 1e-6,
+            f"库里的 y 也是头部坐标 got={back.get('pos_y')}",
+        )
+        # 幂等：再载入一次不应再加 1.65
+        game.load_from_store(scratch)
+        again = game.get_player("MIGR-0001") or {}
+        t.check(
+            abs(float(again.get("pos_y", 0.0)) - 1.65) < 1e-6,
+            f"重复加载不再平移 got={again.get('pos_y')}",
+        )
+        t.eq(again.get("red_name"), False, "旧行的红名默认 False")
 
     except Exception:  # noqa: BLE001 - 测试脚本把异常当失败，不要吃掉
         t.failed.append(("<exception>", traceback.format_exc()))

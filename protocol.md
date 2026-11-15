@@ -1,10 +1,18 @@
-# 众生之门 套接字协议 v1.3（GameTCP）
+# 众生之门 套接字协议 v1.4（GameTCP）
 
-> 实现：`protocol.py`（解析/编码）· `server.py`（监听/帧读取）· `session.py`（长连接、会话 Token、宽限期）· `actions.py`（动作表）
-> 业务流程：`flows.md`（注册 / 登录 / 正常下线 / 意外断开宽限期 / 客户端重连）
-> 状态：**已实现并通过冒烟测试**（`scripts/tcp_smoke_test.py`，115 项）
+> 实现：`protocol.py`（解析/编码）· `server.py`（监听/帧读取）· `session.py`（长连接、会话 Token、宽限期、坐标基准）· `actions.py`（动作表）· `game.py`（热缓存/战斗/死亡）· `hitbox.py`（身体碰撞箱）· `karma.py`（红名判定）
+> 业务流程：`flows.md`（注册 / 登录 / 正常下线 / 意外断开宽限期 / 客户端重连 / 生死流转）
+> 状态：**已实现并通过冒烟测试**（`scripts/tcp_smoke_test.py`，219 项）
 
-v1.3 相对 v1.2 的三处变更（本版重点）：
+v1.4 相对 v1.3 的三处变更（**只加语义，报文结构与哈希规则不变**）：
+
+1. **坐标基准改为头部中心**（§11.1）：协议里所有玩家位置字段都是头部中心的世界坐标，
+   脚底 = 头部 − 1.65m；`client_version < 0.2.0` 的旧客户端由服务端自动 ±1.65m 换算。
+2. **身体碰撞箱 + 部位命中**（§11.2 / §11.3）：服务端按 11 个盒子判定命中部位，
+   伤害 = 25 × 倍率；新增错误码 `NOT_FACING` / `MISS` / `OUT_OF_RANGE`。
+3. **红名（Karma）**（§12）：人类击杀同势力人类 → 击杀者变红；确认死亡解除受害者红名。
+
+v1.3 的三处变更（继续生效）：
 
 1. **取消所有服务端主动推送**：不再有 10Hz 世界广播、建连 `PUSH | token`、join/leave 事件广播。
    一切数据由客户端按需拉取（`peers` / `world` / `state`），**询问频率由客户端自行决定**。
@@ -66,7 +74,7 @@ TheDoorOfBings | 1.3 | <ts> | <encryption> | <client_version> | <platform> | <lo
 | 字段 | 说明 |
 |---|---|
 | 固定魔头 | `TheDoorOfBings`，不符 → `BAD_MAGIC` |
-| version | `1.3` / `1.2` / `1.1` / `1.0`（1.0 是老格式，头行只有前 4 个字段，仍然接受） |
+| version | `1.4` / `1.3` / `1.2` / `1.1` / `1.0`（1.0 是老格式，头行只有前 4 个字段，仍然接受） |
 | ts | Unix 秒级时间戳；与服务端偏差 > `REQUEST_TIME_WINDOW`（默认 **300s**）→ `REQUEST_EXPIRED` |
 | encryption | 目前仅 `none` |
 | client_version | **客户端软件版本**，例 `0.1.0`。每个请求都要带，服务端记进 `devices.client_version` |
@@ -105,6 +113,7 @@ plain_hash | cipher_hash
 
 - **v1.3 联合哈希**：`plain_hash = sha256(第1行原文 + "\n" + 第2行原文 + "\n" + 第3行原文)` 的 hex（64 位小写）。
   即哈希同时覆盖**请求头与正文两行**，改头部（版本、时间戳、client_version…任一字段）都会失效。
+  **v1.4 与 v1.3 规则完全相同**：版本号升级不改变哈希算法，`1.4` 走同一个联合哈希分支。
 - **v1.2 及更早**：`plain_hash = sha256(第2行 + "\n" + 第3行)`（仅正文两行）。服务端按 version 自动区分。
 - **逐字节计算，不要 strip / 不要 trim 行尾空格**
 - `encryption=none` 时 `cipher_hash == plain_hash`
@@ -177,6 +186,9 @@ FAIL | <action> | <code> | <message>
 | `FILE_HASH_MISMATCH` | 登录时带的 `file_hash` 与库里不一致（本地文件被改） | 提示校验客户端文件 |
 | `BAD_SESSION_TOKEN` | 会话 Token 格式非法 | 代码写错了，检查是否原样回传 |
 | `SESSION_TOKEN_EXPIRED` | Token 与本会话不一致（已失效 / 拿的是上一条连接的） | 清掉本地 token，重新 `hello` + `login` |
+| `OUT_OF_RANGE` | 攻击目标超出 `ATTACK_RANGE`（3m） | 走近再打 |
+| `NOT_FACING` | 目标不在攻击朝向锥（60°）内 | 转向目标（按自己的 `yaw` 校正） |
+| `MISS` | 射程与朝向都过，但射线没打到任何身体盒子 | 别乱挥，瞄准身体 |
 | `INTERNAL_ERROR` | 服务端内部异常 | 稍后重试 |
 | `TOO_MANY_CONNECTIONS` | 连接数已满 | 退避重连 |
 
@@ -217,7 +229,7 @@ FAIL | <action> | SESSION_TOKEN_EXPIRED | Token mismatch, please use the latest 
 | action | action_data | 需要登录 | 说明 |
 |---|---|---|---|
 | `ping` | 空 | 否 | 心跳/连通性测试 |
-| `hello` | 空 | 否 | 握手：服务端版本、动作表，**并下发 session_token** |
+| `hello` | 空（可选 `coord_base=head\|feet` 显式声明基准） | 否 | 握手：服务端版本、动作表、坐标基准与碰撞箱能力，**并下发 session_token** |
 | `device` | `<fp_hex>&<length>` | 否 | 签发 / 确认设备 ID（见 §5）。**新签发不写库**，到 `register` 才落库 |
 | `check_name` | `<user_name>` | 否 | 注册前名称查重，回 `{"name","available","reason"}` |
 | `register` | `<user_name>&<race>&<player_id>` | 否 | 注册，`user_id` 由**服务端**生成；后两段可省（`race` 缺省 `human`，`player_id` 为客户端 UUID） |
@@ -247,18 +259,27 @@ FAIL | <action> | SESSION_TOKEN_EXPIRED | Token mismatch, please use the latest 
 `state` 响应：
 
 ```
-OK | state | {"t":1761379200,"seq":42,"rev":7}
+OK | state | {"t":1761379200,"seq":42,"rev":7,"hp":100.0,"hp_max":100.0,"spirit":1.0,"level":1,
+              "kills":0,"deaths":0,"dying":false,"dying_remaining":0.0,
+              "spectating":false,"spectator_remaining":0.0,"red":false,
+              "pos_x":12.5,"pos_y":1.65,"pos_z":-8.0,"yaw":90.0,"coord_base":"head"}
 ```
+
+> v1.4：`state` 的 `pos_y` 按**本连接**的坐标基准下发（`client_version < 0.2.0` 时为脚底坐标），
+> 并新增 `red`（红名）与 `coord_base`（本连接的实际基准）。
 
 `peers` 响应（拉取式在线快照）：
 
 ```
 OK | peers | {"players":[{"user_id":"ZWME-2WKQ","user_name":"勇者","player_name":"勇者","race":"human",
-                          "pos_x":12.5,"pos_y":0.0,"pos_z":-8.0,"yaw":90.0,"state":"moving",
+                          "level":1,"pos_x":12.5,"pos_y":1.65,"pos_z":-8.0,"yaw":90.0,
+                          "coord_base":"head","state":"moving",
                           "hp_max":100.0,"hp":100.0,"stamina_max":100.0,"stamina":100.0,
-                          "mana_max":100.0,"mana":100.0}],
-              "players_rev":7,"world_rev":5,"t":1761379200}
+                          "mana_max":100.0,"mana":100.0,"dying":false,"red":false}],
+              "players_rev":7,"world_rev":5,"coord_base":"head","t":1761379200}
 ```
+
+> v1.4：每行新增 `red`（红名）与 `coord_base`（该行坐标的基准，等于请求方的实际基准，§11.4）。
 
 `world` 响应（含 `world` 元信息 + 全部 `items`）：
 
@@ -274,7 +295,7 @@ OK | world | {"world":{"id":"default","name":"众生之门","seed":0,"rev":5},
 ```
 OK | register | {"user_id":"ZWME-2WKQ","user_name":"勇者",
                   "player_id":"a3f1c8d2-…","player_name":"勇者","race":"elf",
-                  "server_version":"4.0.0","protocol_version":"1.3"}
+                  "server_version":"4.1.0","protocol_version":"1.4"}
 ```
 
 `login` 响应（`server_push=false` / `push_hz=0`，并回写 `session_token`）：
@@ -282,14 +303,16 @@ OK | register | {"user_id":"ZWME-2WKQ","user_name":"勇者",
 ```
 OK | login | {"user_id":"ZWME-2WKQ","user_name":"勇者",
               "player_id":"a3f1c8d2-…","player_name":"勇者","race":"human",
-              "pos_x":12.5,"pos_y":0.0,"pos_z":-8.0,"yaw":90.0,
+              "pos_x":12.5,"pos_y":1.65,"pos_z":-8.0,"coord_base":"head","yaw":90.0,
               "server_push":false,"push_hz":0,"session_token":"9f2c…(32 hex)",
-              "server_version":"4.0.0","protocol_version":"1.3"}
+              "server_version":"4.1.0","protocol_version":"1.4"}
 ```
 
 > `pos_x/pos_y/pos_z/yaw` 是该玩家**上次退出的存档位置**（`enter_world` 已从库/缓存恢复），
 > 客户端进世界首帧应先把本机玩家放到这一点、**再**开始 `state` 上报，否则会用场景默认出生点
 > 覆盖掉存档位置。断线重连不重放（人已在地里）。yaw 单位度，0 = 正北 / -Z，顺时针为正。
+> v1.4：`pos_y` 是**头部中心**（脚底 = `pos_y - 1.65`）；旧客户端（`client_version < 0.2.0`）
+> 收到的 `pos_y` 已自动换回脚底值，`coord_base` 字段如实标记为 `"feet"`。
 
 `logout` 响应：
 
@@ -322,7 +345,7 @@ OK | logout | {"authenticated":false,"saved":true,"user_id":"ZWME-2WKQ"}
 ```
 OK | device | {"device_id":"ab12…","length":1024,"issued_at":1761379200,
                 "known":true,"stored":true,"account":{"user_id":"ZWME-2WKQ","user_name":"勇者"},
-                "server_version":"4.0.0","protocol_version":"1.3"}
+                "server_version":"4.1.0","protocol_version":"1.4"}
 ```
 
 `account` 为 `null` 表示这台设备还没绑账号 → 走 `check_name` + `register`。
@@ -347,16 +370,18 @@ v1.3 服务端**不再主动下发任何帧**（旧 topic `token` / `reset_token
 ## 7. 完整往返示例
 
 ```
-C→S  TheDoorOfBings | 1.3 | 1761379200 | none | 0.1.0 | windows | zh_CN
+C→S  TheDoorOfBings | 1.4 | 1761379200 | none | 0.2.0 | windows | zh_CN
      hello | 
       |  |
      <64hex> | <64hex>          ← 首条 hello 无 token（第 3 行 2 段），哈希覆盖头+正文
 
-S→C  OK | hello | {"magic":"TheDoorOfBings","server_version":"4.0.0","protocol_version":"1.3",
+S→C  OK | hello | {"magic":"TheDoorOfBings","server_version":"4.1.0","protocol_version":"1.4",
                     "server_push":false,"push_hz":0,"autosave_interval":60,"device_id_length":1024,
                     "user_name_max_len":24,"session_token":"9f2c…(32 hex)",
-                    "actions":["check_name","device","hello","item","login","logout","peers","ping",
-                    "register","state","whoami","world"],"now":1761379200}
+                    "actions":["assets","attack","check_name","device","hello","item","login","logout",
+                    "peers","ping","races","register","revive","state","whoami","world"],
+                    "coord_base":"head","coord_base_applied":"head","hitboxes":true,
+                    "attack_cone_deg":60,"now":1761379200}
 
 C→S  … device | 
      9f2c…(token) |  |
@@ -364,7 +389,7 @@ C→S  … device |
 
 S→C  OK | device | {"device_id":"ab12…(2048 hex)","length":1024,"issued_at":1761379200,
                      "known":false,"stored":false,"account":null,
-                     "server_version":"4.0.0","protocol_version":"1.3"}
+                     "server_version":"4.1.0","protocol_version":"1.4"}
 
 C→S  … check_name | 勇者
      9f2c…(token) | <device_hex> | 
@@ -378,14 +403,23 @@ C→S  … register | 勇者&elf&a3f1c8d2-…
 
 S→C  OK | register | {"user_id":"ZWME-2WKQ","user_name":"勇者",
                        "player_id":"a3f1c8d2-…","player_name":"勇者","race":"elf",
-                       "server_version":"4.0.0","protocol_version":"1.3"}
+                       "server_version":"4.1.0","protocol_version":"1.4"}
 
-C→S  … state | 12.5&0&-8&180&77&moving&33&44;;peers |
+C→S  … state | 12.5&1.65&-8&180&77&moving&33&44;;peers |
      9f2c…(token) |  |
      …                            ← 批量：一次报文里上报位置 + 拉取在线列表
+                                    （v1.4 的 y=1.65 是头部中心；旧客户端写脚底值即可）
 
-S→C  OK | state | {"t":1761379200,"seq":2,"rev":2}
-S→C  OK | peers | {"players":[…],"players_rev":2,"world_rev":5,"t":1761379200}
+S→C  OK | state | {"t":1761379200,"seq":2,"rev":2,"pos_y":1.65,"red":false,"coord_base":"head",…}
+S→C  OK | peers | {"players":[…],"players_rev":2,"world_rev":5,"coord_base":"head","t":1761379200}
+
+C→S  … attack | ZWME-2WKQ
+     9f2c…(token) |  |
+     …
+
+S→C  OK | attack | {"ok":true,"target":"ZWME-2WKQ","part":"head","multiplier":2.0,"damage":50.0,
+                     "hp":50.0,"hp_max":100.0,"dying":false,"dying_remaining":0.0,
+                     "distance":2.31,"hit_t":2.2,"killer_red":false,"victim_red":false,"attack_at":1761379200}
 
 C→S  … logout | 
      9f2c…(token) |  |
@@ -408,15 +442,15 @@ S→C  OK | logout | {"authenticated":false,"saved":true,"user_id":"ZWME-2WKQ"}
 | 路径 | 说明 |
 |---|---|
 | `GET /` | 服务名与版本 |
-| `GET /api/v1/endpoint` | `{"tcp":{"host":"…","port":5423},"protocol_version":"1.3","service_version":"4.0.0","transport":"tcp","encoding":"utf-8"}` |
+| `GET /api/v1/endpoint` | `{"tcp":{"host":"…","port":5423},"protocol_version":"1.4","service_version":"4.1.0","transport":"tcp","encoding":"utf-8"}` |
 | `GET /game/api` | 同上（旧路径，过渡期保留） |
 | `GET /healthz` | 健康检查（仅 HTTP 服务自身，不含游戏服状态） |
 
 `host` / `port` 来自 server 组件的 `.env`（`HOST` / `PORT`），需与本组件的实际监听地址一致。
 
 > ⚠️ 下发版本号写死在 server 组件的 `config.py`（`PROTOCOL_VERSION` / `SERVICE_VERSION`），
-> 该分支若仍是旧值，**需要跟着改成 `1.3` / `4.0.0`**，否则客户端会拿到旧的兼容提示。
-> 协议本身向后兼容（v1.3 服务端仍接受 v1.2 报文），不影响连入。
+> 该分支若仍是旧值，**需要跟着改成 `1.4` / `4.1.0`**，否则客户端会拿到旧的兼容提示。
+> 协议本身向后兼容（v1.4 服务端仍接受 v1.0~v1.3 报文），不影响连入。
 
 ---
 
@@ -443,14 +477,15 @@ S→C  OK | logout | {"authenticated":false,"saved":true,"user_id":"ZWME-2WKQ"}
 | action | payload | 鉴权 | OK data |
 |---|---|---|---|
 | `races` | 空 | 不需要 | `{"races": [{"key","name","dev_only"}]}` |
-| `attack` | `<target_user_id>` | 需要 | `{"ok","target","damage","hp","hp_max","dying","dying_remaining","distance"}` |
+| `attack` | `<target_user_id>` | 需要 | `{"ok","target","part","multiplier","damage","hp","hp_max","dying","dying_remaining","distance","hit_t","killer_red","victim_red"}` |
 | `revive` | `<target_user_id>` | 需要 | `{"ok","target","hp","hp_max","distance"}` |
 | `assets` | `<sub>&<path>[&<offset>][&<length>]` | 需要 | 见下 |
 
 * `races`：种族清单**由服务端裁定**，开发阶段只返回 `human`。`race.tscn` 据此渲染选项，
   `register` 的 race 字段若不在清单里一律落回 `human`。
-* `attack`：服务端判定射程（3m）/ 冷却（0.8s）/ 目标状态，单次伤害 25；目标 HP 归零进入
-  **濒死**（`dying=true`，5 秒窗口），不是立刻死亡。
+* `attack`：服务端判定射程（3m）/ 朝向锥（60°）/ 冷却（0.8s）/ 目标状态，并按 11 个身体盒子
+  判定**命中部位**（§11.2 / §11.3），伤害 = `25 × 倍率`（头部 50 / 躯干 25 …）；
+  目标 HP 归零进入**濒死**（`dying=true`，5 秒窗口），不是立刻死亡。
 * `revive`：治疗者需在 5m 内，把濒死目标拉起（恢复到 30% 生命），并清空击杀归属。
 * `assets` 子动作：
   * `list&path` —— 列目录，返回 `entries`（name / is_dir / size / mtime）与 `chunk_bytes`；
@@ -462,5 +497,130 @@ S→C  OK | logout | {"authenticated":false,"saved":true,"user_id":"ZWME-2WKQ"}
 
 `state` 的 OK data 在 v1.3 扩展里追加了权威自身状态：
 `hp / hp_max / spirit / level / kills / deaths / dying / dying_remaining / spectating / spectator_remaining / pos_* / yaw`。
-客户端只读，不再用本地 HP 覆盖服务端。
+客户端只读，不再用本地 HP 覆盖服务端。v1.4 再追加 `red`（红名）与 `coord_base`（坐标基准，见 §11.1）。
+
+---
+
+## 11. 坐标基准与身体碰撞箱（v1.4 / 服务 4.1.0）
+
+> 本节是**冻结契约**：客户端与服务端各自实现时必须逐字段对齐。改动先改这里。
+
+### 11.1 坐标基准：头部
+
+- 协议里所有"玩家位置"字段（`state` 上报的 `x & y & z`、`login` 回写的 `pos_x/pos_y/pos_z`、`peers` 每行的 `pos_*`）**统一表示头部中心**的世界坐标。
+- 脚底 = 头部 − `HEAD_OFFSET_Y`（默认 **1.65m**）。
+- 数据库 `player.pos_*` 同步改为头部坐标；`player.coord_base` 列记录该行是按哪种基准写的：
+  - `'feet'`：旧版客户端遗留（v0.1.x），服务端在 `load_player` / `enter_world` 时 **一次性 +1.65m** 并改写为 `'head'`；
+  - `'head'`：已迁移（缺省 / 非法值也按 head 处理——服务端自己造的行一定是 head）。
+- **旧客户端兼容**：`hello` 会记录本连接的 `client_version`（请求头第 1 行第 5 段）。
+  服务端对 `client_version < 0.2.0`（或空）的连接按旧语义处理——收到的 `state` 位置 **+1.65m** 换成头部再入库、
+  下发时 **−1.65m** 换回脚底（这样旧客户端收发都是脚底坐标，往返一致）。
+  客户端本次升级必须把 `project.godot` 的 `application/config/version` 提到 **0.2.0**，否则会被当成旧客户端。
+- `hello` 响应新增：`"coord_base":"head"`、`"hitboxes":true`、`"attack_cone_deg":60`。
+
+> **实现补充（服务端 `session.Session.coord_base`）**：
+> * `hello` 的 payload 允许显式声明基准：`hello | head` 或 `hello | coord_base=feet`，优先级高于 `client_version`；
+> * `hello` 响应里 `coord_base` 恒为协议基准 `"head"`，另给 `coord_base_applied` 表示**本连接**实际生效的基准；
+> * `state` 响应、`peers` 每行与 `peers` 顶层也都带 `coord_base`（= 本次下发坐标所用基准），
+>   客户端只应拿这个字段决定如何解释 `pos_y`，不要自己猜客户端版本；
+> * 迁移写回库：启动加载时把 `'feet'` 行 +1.65m、`rev` 抬高一格，下一轮 autosave 写回 `coord_base='head'`（幂等）。
+
+### 11.2 人体模型：11 个盒子
+
+单位米，**相对头部中心**（+Y 向上，−Z 为角色正面），绕 Y 轴随 `yaw` 旋转。
+`l` = 角色左手侧（+X），`r` = 右手侧（−X）。
+
+| part | 中心 (x, y, z) | 半尺寸 (hx, hy, hz) | 伤害倍率 |
+|---|---|---|---|
+| `head` | 0, 0, 0 | 0.11, 0.10, 0.11 | **2.0** |
+| `neck` | 0, −0.15, 0 | 0.06, 0.05, 0.06 | **1.5** |
+| `torso` | 0, −0.45, 0 | 0.18, 0.25, 0.11 | **1.0** |
+| `upper_arm_l` | +0.22, −0.40, 0 | 0.05, 0.15, 0.05 | 0.6 |
+| `upper_arm_r` | −0.22, −0.40, 0 | 0.05, 0.15, 0.05 | 0.6 |
+| `forearm_l` | +0.26, −0.68, 0 | 0.045, 0.14, 0.045 | 0.5 |
+| `forearm_r` | −0.26, −0.68, 0 | 0.045, 0.14, 0.045 | 0.5 |
+| `thigh_l` | +0.09, −0.92, 0 | 0.07, 0.215, 0.07 | 0.8 |
+| `thigh_r` | −0.09, −0.92, 0 | 0.07, 0.215, 0.07 | 0.8 |
+| `shin_l` | +0.09, −1.35, 0 | 0.055, 0.22, 0.055 | 0.6 |
+| `shin_r` | −0.09, −1.35, 0 | 0.055, 0.22, 0.055 | 0.6 |
+
+- 基础伤害仍是 `ATTACK_DAMAGE = 25`，实际伤害 = `25 × 倍率`（头部一击 50、颈部 37.5、躯干 25、小臂 12.5…），向下取整到 0.1。
+- 两侧命名固定为 `_l` / `_r`，禁止出现 `left/right` 混写。
+
+### 11.3 命中判定（服务端权威）
+
+1. 原点 = **攻击者头部**；方向 = `normalize(目标头部 − 攻击者头部)`。
+2. 朝向校验：`dot(攻击者前向, 方向) ≥ cos(60°)`，否则 `FAIL | attack | NOT_FACING`（前向由攻击者 `yaw` 推出）。
+3. 把射线变换到目标局部系（先减目标头部、再绕 Y 轴反向旋转 `yaw`），对 11 个 AABB 做 slab 测试，取 `t` 最小且 `t ≤ ATTACK_RANGE(3m)` 的盒子。
+4. 全部不命中 → `FAIL | attack | MISS`（射程内没打中身体）。超出距离仍是 `OUT_OF_RANGE`。
+5. 命中盒子的倍率 × 基础伤害，写 `last_attacker`、按 §12 判红名。
+
+> **实现补充（射线方向，必须两边一致）**：第 1 条的"方向"若照字面取"朝目标头部"，
+> 射线终点正好是 `head` 盒中心（半尺寸 0.10~0.11m），**任何射程内的攻击都会先命中头部盒**，
+> §11.2 的 11 个盒子、部位倍率与 `MISS` 全部不可达。服务端 `hitbox.resolve_hit` 因此：
+>
+> * 射线方向 = **攻击者 `yaw` 推出的水平前向**（`+Y` 分量为 0，`yaw` 由攻击者最近一次 `state` 决定，服务端不再自动转向）；
+> * "目标头部 − 攻击者头部"只用于第 2 条的 60° 朝向锥校验；
+> * 于是等高的平射穿过 `head` 盒（命中头部 ×2），攻击者低 0.30m 的平射穿过 `torso` 盒（×1），
+>   偏出身体轮廓则 `MISS`——这才能让 11 个盒子和倍率真正生效。
+> * 客户端做本地表现时请用同一规则（`yaw` 前向射线 + 目标局部系 11 盒 slab 测试），否则命中特效会和服务端伤害对不上。
+> * `hit_t` 是命中处的射线距离（米，调试用），客户端可忽略。
+
+### 11.4 `attack` 响应（新增字段）
+
+```
+OK | attack | {"ok":true,"target":"ZWME-2WKQ","part":"head","multiplier":2.0,"damage":50.0,
+                "hp":50.0,"hp_max":100.0,"dying":false,"dying_remaining":0.0,
+                "distance":2.31,"hit_t":2.2,"killer_red":true,"victim_red":false}
+```
+
+- `damage` 已按部位倍率算好并取整到 0.1（头 50 / 颈 37.5 / 躯干 25 / 上臂 15 / 小臂 12.5 / 大腿 20 / 小腿 15）。
+- `killer_red` / `victim_red` 是**本次攻击之后**双方的红名标记（红名只在真死亡时变化，见 §12）。
+- `hit_t` 为命中点的射线距离（米），调试用，客户端可忽略。
+- `revive` 不变（治疗不需要部位）。
+- `state` 响应新增自身 `"red": false`；`peers` 每行新增 `"red": false`、`"coord_base":"head"`（详见 §11.1）。
+
+---
+
+## 12. 红名（Karma，v1.4）
+
+规则来源：`main/材料/文档/规则/rule.md` 第三章。代码落地按下面执行。
+
+### 12.1 触发
+
+**人类击杀同势力人类** → 击杀者进入红名（`red = true`）。
+"击杀"的时点 = 中毒者濒死 5 秒窗口结束、被服务端判定为**真死亡**的那一刻（不是打空血那一瞬）。
+本期只有 `human` 一个种族、没有势力系统 → 所有人类视为同势力，因此**人类杀人类必定触发**。
+
+### 12.2 豁免（判定函数留参，当前无对应实体）
+
+不同势力人类互杀 / 人类杀妖精 / 妖精杀任何玩家 / BOSS 身份击杀，均不触发。
+实现为 `karma.should_become_red(killer, victim) -> bool`，参数里带 `race` / `faction` / `is_boss`，本期这些字段取不到就落默认值。
+
+### 12.3 惩罚（本期能力边界）
+
+- "无法接取高阶任务"：**没有任务系统**，本期不实现，只在红名字段上留好读取口。
+- "被标记危险目标、可被无限制攻击"：攻击本来就没有限制，服务端**不额外加限制**；
+  红名只是给客户端看的标记（`peers[].red` / `state.red`），客户端负责标红。
+
+### 12.4 解除
+
+- **确认死亡**（5 秒濒死窗内未被 `revive`）→ 清红名。
+- 账号注销后重建角色 → 新行天然为 `false`。
+- 没有"时间到自动解除"，也没有主动解除动作。
+
+### 12.5 存储与观测
+
+| 位置 | 字段 |
+|---|---|
+| `player` 表 | `red_name BOOLEAN NOT NULL DEFAULT FALSE`、`red_at DOUBLE PRECISION`（变红时间，审计用） |
+| `player` 表 | `coord_base TEXT NOT NULL DEFAULT 'feet'`（**迁移用默认值**：ALTER 补出来的旧行是脚底基准，加载时 +1.65m 并改写为 `'head'`，之后恒为 `'head'`） |
+| `state` 响应 | `red` |
+| `peers` 行 | `red` |
+| 日志 | 变红 / 解除各打一条 INFO（含击杀者与被击杀者 user_id） |
+
+> 实现补充：判定函数是 `karma.should_become_red(killer, victim)`，两个参数都是玩家的 dict 行；
+> 取不到的字段落默认值（`race='human'` / `faction='common'` / `is_boss=False`），
+> 所以本期"人类杀人类"必定触发。结算点只在 `game._resolve_timers` 的 `died` 分支
+> （濒死窗口结束、判真死亡），`revive` 成功路径不碰红名。
 

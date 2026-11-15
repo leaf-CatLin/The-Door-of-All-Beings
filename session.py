@@ -21,12 +21,22 @@ import socket
 import threading
 import time
 
+import protocol
+
 log = logging.getLogger(__name__)
 
 _ids = itertools.count(1)
 
 ## Token 有效期（秒）
 TOKEN_EXPIRE = 180
+
+## 客户端版本 >= 这个值才按「头部坐标」上报（protocol.md §11.1）；
+## 更老的客户端（含空版本）按旧语义按脚底坐标处理，服务端自动 ±1.65m 换算。
+CLIENT_HEAD_BASE_MIN_VERSION = (0, 2, 0)
+
+## 坐标基准取值
+COORD_BASE_HEAD = "head"
+COORD_BASE_FEET = "feet"
 
 
 class Session:
@@ -35,7 +45,7 @@ class Session:
     __slots__ = (
         "sock", "addr", "sid", "user_id", "user_name", "device_id_hex",
         "client_version", "platform", "locale", "connected_at", "last_seen",
-        "items_rev", "_lock", "_closed", "hub",
+        "items_rev", "coord_base_override", "_lock", "_closed", "hub",
         "session_token", "token_issued_at", "suspended", "suspend_deadline",
     )
 
@@ -51,6 +61,8 @@ class Session:
         self.client_version = ""
         self.platform = ""
         self.locale = ""
+        ## 本连接的坐标基准（None = 按 client_version 自动判定）
+        self.coord_base_override: str = ""
 
         self.connected_at = time.time()
         self.last_seen = self.connected_at
@@ -93,6 +105,27 @@ class Session:
         return self.user_id != ""
 
     @property
+    def coord_base(self) -> str:
+        """本连接的坐标基准（protocol.md §11.1）：``head`` / ``feet``。
+
+        优先级：``hello`` 里的显式声明 > 请求头第 5 段的 ``client_version``
+        （>= 0.2.0 视为 head，更老或为空按旧脚底语义）。
+        服务端收到的 ``state`` 坐标会按这个基准换算到头部再入库，
+        下发的坐标（``state`` / ``peers`` / ``login``）也按它换算回去。
+        """
+        if self.coord_base_override in (COORD_BASE_HEAD, COORD_BASE_FEET):
+            return self.coord_base_override
+        try:
+            version = protocol._version_tuple(self.client_version)
+        except AttributeError:  # pragma: no cover - 防御：protocol 结构变化
+            version = (0, 0)
+        return (
+            COORD_BASE_HEAD
+            if version >= CLIENT_HEAD_BASE_MIN_VERSION
+            else COORD_BASE_FEET
+        )
+
+    @property
     def closed(self) -> bool:
         return self._closed
 
@@ -118,7 +151,10 @@ class Session:
 
     def describe(self) -> str:
         who = f"{self.user_name}({self.user_id})" if self.authenticated else "anonymous"
-        return f"session#{self.sid} {self.ip} {who} v{self.client_version or '?'}"
+        return (
+            f"session#{self.sid} {self.ip} {who} "
+            f"v{self.client_version or '?'} coord={self.coord_base}"
+        )
 
     # ------------------------------------------------------------------ #
     # 发送

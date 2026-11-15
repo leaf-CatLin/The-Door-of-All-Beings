@@ -1,21 +1,24 @@
-"""套接字协议（v1.3）：报文解析 / 响应构造 / 错误码。
+"""套接字协议（v1.4）：报文解析 / 响应构造 / 错误码。
 
 完整规范见 protocol.md + flows.md。举要：
 
 请求（4 行，行间 ``\\n``，整体以 ``\\n`` 结尾作为帧边界）::
 
-    TheDoorOfBings | 1.3 | <ts> | <encryption> | <client_version> | <platform> | <locale>
+    TheDoorOfBings | 1.4 | <ts> | <encryption> | <client_version> | <platform> | <locale>
     <action> | <action_data>[ ;; <action> | <action_data>]*
     <session_token> | <device_id_hex> | <user_id>
     <plain_hash> | <cipher_hash>
 
-v1.3 的两处不兼容变更：
+v1.3 的两处不兼容变更（v1.4 继续沿用，报文格式没动）：
 
 * **请求尾哈希改为「请求头 + 正文」联合哈希**：
   ``plain_hash = sha256(第1行 + "\\n" + 第2行 + "\\n" + 第3行)``（逐字节，不 strip）。
   v1.2 及更早仍按「仅正文两行」计算，服务端按 version 自动区分。
-* **第 2 行支持批量多 action**（仅 v1.3）：多个 ``action|data`` 组用 ``;;`` 连接，
+* **第 2 行支持批量多 action**（仅 v1.3 起）：多个 ``action|data`` 组用 ``;;`` 连接，
   服务端逐个执行、**按序返回多行** OK/FAIL。
+
+v1.4 只加语义、不改帧结构：红名（§12）、头部坐标基准（§11.1）、
+身体碰撞箱部位命中（§11.2/§11.3）与 ``NOT_FACING`` / ``MISS`` / ``OUT_OF_RANGE`` 错误码。
 
 第 3 行 v1.2 起扩展为 3 字段（session_token | device_id | user_id），
 v1.1 客户端仍发 2 字段（device_id | user_id），服务端自动兼容。
@@ -45,9 +48,10 @@ from dataclasses import dataclass, field
 # ---------------------------------------------------------------------------
 MAGIC = "TheDoorOfBings"
 ## 接受的历史版本。1.0 报文头只有 4 个字段，1.1 追加了客户端信息，
-## 1.2 加入会话 Token，1.3 改为「头+正文」联合哈希并支持批量多 action。
-SUPPORTED_VERSIONS = ("1.0", "1.1", "1.2", "1.3")
-CURRENT_VERSION = "1.3"
+## 1.2 加入会话 Token，1.3 改为「头+正文」联合哈希并支持批量多 action，
+## 1.4 追加红名 / 头部坐标基准 / 身体碰撞箱（报文格式与哈希规则不变，仍走 1.3 的联合哈希分支）。
+SUPPORTED_VERSIONS = ("1.0", "1.1", "1.2", "1.3", "1.4")
+CURRENT_VERSION = "1.4"
 ## 当前只支持不加密；引入加密后把新算法加进来即可
 ENCRYPTION_METHODS = ("none",)
 
@@ -118,6 +122,10 @@ E_SHUTTING_DOWN = "SHUTTING_DOWN"
 E_BAD_TOKEN = "BAD_SESSION_TOKEN"
 E_TOKEN_EXPIRED = "SESSION_TOKEN_EXPIRED"
 E_FILE_HASH_MISMATCH = "FILE_HASH_MISMATCH"
+## v1.4 战斗相关（protocol.md §11.3）
+E_OUT_OF_RANGE = "OUT_OF_RANGE"
+E_NOT_FACING = "NOT_FACING"
+E_MISS = "MISS"
 
 # 错误码 -> 默认人读说明
 ERROR_MESSAGES = {
@@ -147,6 +155,9 @@ ERROR_MESSAGES = {
     E_BAD_TOKEN: "Invalid session token",
     E_TOKEN_EXPIRED: "Session token expired, reconnect",
     E_FILE_HASH_MISMATCH: "Login file hash mismatch, client files were modified",
+    E_OUT_OF_RANGE: "Target out of attack range",
+    E_NOT_FACING: "Target is outside the attack facing cone",
+    E_MISS: "Attack missed the body",
 }
 
 

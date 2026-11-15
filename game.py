@@ -35,7 +35,11 @@ players 元素结构（对应表 player）
   "player_name": "勇者",   # 角色名（游戏内显示）
   "race": "human",         # 种族
   "device_id": "ab cd…",  # 绑定设备（只在内存里，不落库）
-  "pos_x": 12.5, "pos_y": 0.0, "pos_z": -8.0, "yaw": 180.0,
+  "pos_x": 12.5, "pos_y": 1.65, "pos_z": -8.0, "yaw": 180.0,
+                          # **头部中心的世界坐标**（protocol.md §11.1）：
+                          # 脚底 = pos_y - HEAD_OFFSET_Y(1.65)
+  "coord_base": "head",    # 这一行的坐标基准（内存里恒为 head；
+                          # 库里旧行是 'feet'，加载时一次性 +1.65 迁移）
   "state": "moving",       # idle / moving / dead
   "online": True,
   "hp_max": 100.0, "hp": 88.0,
@@ -49,6 +53,8 @@ players 元素结构（对应表 player）
   "last_attacker": "",    # 最后一次伤害来源（死亡结算赏金）
   "inventory": {},        # 背包
   "kills": 0, "deaths": 0,
+  "red_name": False,      # 红名（protocol.md §12）
+  "red_at": None,         # 变红时间（epoch 秒）
   "rev": 7,
   "updated_at": 1761379200.0,
 }
@@ -64,6 +70,9 @@ import time
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterator
+
+import hitbox
+import karma
 
 log = logging.getLogger(__name__)
 
@@ -125,6 +134,22 @@ KILL_SPIRIT_RATIO_HIGHER = 0.75
 KILL_SPIRIT_RATIO_EQUAL = 0.5
 KILL_SPIRIT_RATIO_LOWER = 0.25
 
+# ---------------------------------------------------------------------------
+# 坐标基准（protocol.md §11.1）
+# ---------------------------------------------------------------------------
+## 头部 → 脚底的偏移（米），数值本身在 hitbox 里冻结
+HEAD_OFFSET_Y = hitbox.HEAD_OFFSET_Y
+## 内存 / 库里的 pos_* 一律是头部中心
+COORD_BASE_HEAD = "head"
+## 旧客户端（v0.1.x）按脚底上报；库里的旧行也标记成 feet，加载时一次性迁移
+COORD_BASE_FEET = "feet"
+COORD_BASES = (COORD_BASE_HEAD, COORD_BASE_FEET)
+
+# ---------------------------------------------------------------------------
+# 红名（protocol.md §12）
+# ---------------------------------------------------------------------------
+## 红名的触发条件与豁免规则都在 karma 模块里（human × 同势力 human 必定触发）
+
 
 # ---------------------------------------------------------------------------
 # 归一工具
@@ -175,6 +200,45 @@ def _apply_stat(row: dict, key: str, value) -> None:
         return
     cap = _num(row.get(f"{key}_max"), 100.0)
     row[key] = max(0.0, min(cap, raw))
+
+
+def _bool(value, default: bool = False) -> bool:
+    """宽容取布尔：None / 空串回默认值，字符串按 1/true/yes/on/t 认。"""
+    if value is None or value == "":
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on", "t")
+
+
+def coord_base_of(row: dict) -> str:
+    """取一行数据记录的坐标基准；缺省按 head 处理（服务端自己造的行一定是 head）。"""
+    base = str(row.get("coord_base") or COORD_BASE_HEAD).strip().lower()
+    return base if base in COORD_BASES else COORD_BASE_HEAD
+
+
+def normalize_coord_base(coord_base) -> str:
+    """把「会话/客户端声明的基准」归一成 head / feet（非法值按 head）。"""
+    base = str(coord_base or COORD_BASE_HEAD).strip().lower()
+    return base if base in COORD_BASES else COORD_BASE_HEAD
+
+
+def to_head_y(value, coord_base=COORD_BASE_HEAD) -> float | None:
+    """客户端上报的 Y → 头部基准。非法坐标返回 None（调用方回 BAD_PAYLOAD）。"""
+    raw = _coord(value)
+    if raw is None:
+        return None
+    if normalize_coord_base(coord_base) == COORD_BASE_FEET:
+        return raw + HEAD_OFFSET_Y
+    return raw
+
+
+def from_head_y(value, coord_base=COORD_BASE_HEAD) -> float:
+    """头部基准的 Y → 要下发给该连接的基准（旧客户端减 1.65）。"""
+    out = _num(value)
+    if normalize_coord_base(coord_base) == COORD_BASE_FEET:
+        return out - HEAD_OFFSET_Y
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -262,7 +326,11 @@ def _resolve_timers(row: dict, now: float) -> list[str]:
         row["spectator_until"] = now + SPECTATOR_SECONDS
         row["hp"] = 0.0
         row["state"] = "dead"
+        # §12.1 的时点就在这里：濒死窗口结束、判定**真死亡**的那一刻，
+        # 击杀者变红、受害者清红名（复活成功的路径不会走到这里，两边都不动）。
+        killer_id = str(row.get("last_attacker") or "").strip()
         _transfer_kill_spirit(row, now)
+        _settle_karma_on_death(row, killer_id, now)
         events.append("died")
 
     until = row.get("spectator_until")
@@ -279,6 +347,40 @@ def _resolve_timers(row: dict, now: float) -> list[str]:
         events.append("respawned")
 
     return events
+
+
+def _settle_karma_on_death(victim: dict, killer_id: str, now: float) -> None:
+    """真死亡时的红名结算（protocol.md §12.1 / §12.4）。调用方必须持锁。
+
+    * 受害者：**清红名**（死亡是唯一的解除途径，见 §12.4）；
+    * 击杀者：按 :func:`karma.should_become_red` 判定，命中则变红并记 ``red_at``。
+
+    击杀者此刻可能已经下线（行不在热缓存里）——那就只记一条 WARNING：
+    没有热缓存行可以承载标记，等它下次上线时由库里的旧值决定。
+    """
+    victim_id = str(victim.get("user_id") or "")
+    if victim.get("red_name"):
+        log.info("红名解除：%s 确认死亡（红名玩家被杀）", victim_id)
+    victim["red_name"] = False
+    victim["red_at"] = None
+    victim["rev"] = int(victim.get("rev", 0)) + 1
+    victim["updated_at"] = now
+
+    killer_id = str(killer_id or "").strip()
+    if not killer_id or killer_id == victim_id:
+        return
+    killer = players.get(killer_id)
+    if killer is None:
+        log.warning("红名判定跳过：击杀者 %s 不在热缓存（已下线）", killer_id)
+        return
+    if not karma.should_become_red(killer, victim):
+        return
+    if not killer.get("red_name"):
+        log.info("红名：%s 击杀同势力人类 %s → 进入红名", killer_id, victim_id)
+    killer["red_name"] = True
+    killer["red_at"] = now
+    killer["rev"] = int(killer.get("rev", 0)) + 1
+    killer["updated_at"] = now
 
 
 def _transfer_kill_spirit(victim: dict, now: float) -> None:
@@ -482,6 +584,9 @@ def _new_player_row(
         "inventory": {},
         "kills": 0,
         "deaths": 0,
+        "red_name": False,        # 红名（§12）
+        "red_at": None,
+        "coord_base": COORD_BASE_HEAD,   # 内存行一律头部基准
     })
     return row
 
@@ -549,10 +654,18 @@ def _normalize_player_row(row: dict) -> dict | None:
     启动预载与「销毁后重连重载」共用这一份规则，两边行为必须一致：
     ``online`` 一律 False（拿到这条数据的人还没上线，由 enter_world 置 True），
     ``rev`` 原样继承（否则写库会被 rev 门禁拒掉）。
+
+    **坐标基准迁移**（protocol.md §11.1）：库里 ``coord_base='feet'`` 的旧行
+    在这里一次性 +1.65m 改写为 ``'head'``；缺省 / 非法值按 head 处理
+    （服务端自己造的行一定是 head，只有 ALTER 补出来的旧行才是 feet）。
     """
     user_id = str(row.get("user_id") or "").strip()
     if not user_id:
         return None
+    base = coord_base_of(row)
+    pos_y = _num(row.get("pos_y"))
+    if base == COORD_BASE_FEET:
+        pos_y += HEAD_OFFSET_Y
     return {
         "user_id": user_id,
         "user_name": str(row.get("user_name") or ""),
@@ -562,9 +675,10 @@ def _normalize_player_row(row: dict) -> dict | None:
         "race": str(row.get("race") or DEFAULT_RACE),
         "device_id": "",          # 设备不在 player 表里
         "pos_x": _num(row.get("pos_x")),
-        "pos_y": _num(row.get("pos_y")),
+        "pos_y": pos_y,
         "pos_z": _num(row.get("pos_z")),
         "yaw": _norm_yaw(row.get("yaw")),
+        "coord_base": COORD_BASE_HEAD,
         "state": str(row.get("state") or "idle"),
         "online": False,           # 重启后/重载时没人在线
         "hp_max": _num(row.get("hp_max"), 100.0),
@@ -584,6 +698,8 @@ def _normalize_player_row(row: dict) -> dict | None:
         "inventory": row.get("inventory") if isinstance(row.get("inventory"), dict) else {},
         "kills": int(row.get("kills") or 0),
         "deaths": int(row.get("deaths") or 0),
+        "red_name": _bool(row.get("red_name")),
+        "red_at": _num(row.get("red_at")) if row.get("red_at") is not None else None,
         "rev": int(row.get("rev") or 0),
         "updated_at": _num(row.get("updated_at"), time.time()),
     }
@@ -688,9 +804,18 @@ def destroy_player(user_id: str) -> bool:
     return existed
 
 
-def players_payload(include_offline: bool = False) -> list[dict]:
-    """在线玩家快照。旁观者（无实体）不入列表，濒死者仍在列表里（state=dead）。"""
+def players_payload(
+    include_offline: bool = False,
+    coord_base: str = COORD_BASE_HEAD,
+) -> list[dict]:
+    """在线玩家快照。旁观者（无实体）不入列表，濒死者仍在列表里（state=dead）。
+
+    ``coord_base`` 是**本次下发的坐标基准**（§11.4）：给旧客户端（v0.1.x）发时
+    统一减 1.65m 转成脚底坐标，并且每行的 ``coord_base`` 字段如实写成 ``'feet'``；
+    给新客户端发时原样（头部基准）。
+    """
     now = time.time()
+    base = normalize_coord_base(coord_base)
     with _lock:
         return [
             {
@@ -700,9 +825,10 @@ def players_payload(include_offline: bool = False) -> list[dict]:
                 "race": p.get("race", DEFAULT_RACE),
                 "level": int(p.get("level", 1) or 1),
                 "pos_x": p.get("pos_x", 0.0),
-                "pos_y": p.get("pos_y", 0.0),
+                "pos_y": from_head_y(p.get("pos_y"), base),
                 "pos_z": p.get("pos_z", 0.0),
                 "yaw": p.get("yaw", 0.0),
+                "coord_base": base,
                 "state": p.get("state", "idle"),
                 "hp_max": p.get("hp_max", 100.0),
                 "hp": p.get("hp", 100.0),
@@ -711,15 +837,23 @@ def players_payload(include_offline: bool = False) -> list[dict]:
                 "mana_max": p.get("mana_max", 100.0),
                 "mana": p.get("mana", 100.0),
                 "dying": _is_dying(p),
+                "red": bool(p.get("red_name")),
             }
             for p in players.values()
             if (include_offline or p.get("online", False)) and not _is_spectating(p, now)
         ]
 
 
-def self_payload(user_id: str) -> dict | None:
-    """自己的权威状态（state 动作的返回值，客户端据此刷新 HP / 灵力 / 等级 / 生死）。"""
+def self_payload(
+    user_id: str,
+    coord_base: str = COORD_BASE_HEAD,
+) -> dict | None:
+    """自己的权威状态（state 动作的返回值，客户端据此刷新 HP / 灵力 / 等级 / 生死 / 红名）。
+
+    ``coord_base`` 语义同 :func:`players_payload`：``pos_*`` 按该基准下发。
+    """
     now = time.time()
+    base = normalize_coord_base(coord_base)
     with _lock:
         row = players.get(user_id)
         if row is None:
@@ -746,17 +880,26 @@ def self_payload(user_id: str) -> dict | None:
             "spectating": _is_spectating(row, now),
             "spectator_remaining": spectator_remaining,
             "pos_x": _num(row.get("pos_x")),
-            "pos_y": _num(row.get("pos_y")),
+            "pos_y": from_head_y(row.get("pos_y"), base),
             "pos_z": _num(row.get("pos_z")),
             "yaw": _norm_yaw(row.get("yaw")),
+            "coord_base": base,
+            "red": bool(row.get("red_name")),
         }
 
 
 def attack(attacker_id: str, target_id: str, now: float | None = None) -> dict:
-    """近战攻击：射程 / 冷却 / 目标校验全部在服务端做。
+    """近战攻击：射程 / 朝向 / 冷却 / 目标状态 / 部位命中全部在服务端做。
 
-    返回 ``{"ok": True, ...}`` 或 ``{"ok": False, "error": "<原因>"}``。
-    命中使目标 HP 归零时进入濒死（5 秒内可被 revive 救回）。
+    命中判定见 ``hitbox``（protocol.md §11.2 / §11.3）：
+
+    * 原点 = 攻击者**头部**；方向 = 攻击者 ``yaw`` 推出的水平前向；
+    * 60° 朝向锥不过 → ``NOT_FACING``；射程内没打到任何盒子 → ``MISS``；
+    * 命中部位伤害 = ``ATTACK_DAMAGE(25) × 倍率``（头 50 / 颈 37.5 / 躯干 25 …）。
+
+    返回 ``{"ok": True, ...}`` 或 ``{"ok": False, "error": ..., "code": ...}``。
+    HP 归零进入濒死（5 秒内可被 revive 救回）；**红名不在这里结算**，
+    只在濒死窗口结束判真死亡时结算（§12.1，见 ``_settle_karma_on_death``）。
     """
     now = time.time() if now is None else now
     if not target_id:
@@ -784,20 +927,55 @@ def attack(attacker_id: str, target_id: str, now: float | None = None) -> dict:
 
         last = _num(attacker.get("attack_at"))
         if now - last < ATTACK_COOLDOWN:
-            return {"ok": False, "error": "攻击冷却中", "cooldown": ATTACK_COOLDOWN - (now - last)}
+            return {
+                "ok": False, "error": "攻击冷却中",
+                "cooldown": ATTACK_COOLDOWN - (now - last),
+            }
 
         dist = _distance(attacker, target)
         if dist > ATTACK_RANGE:
-            return {"ok": False, "error": "目标超出射程", "distance": round(dist, 2)}
+            return {
+                "ok": False, "error": "目标超出射程",
+                "code": "OUT_OF_RANGE", "distance": round(dist, 2),
+            }
 
+        attacker_yaw = _norm_yaw(attacker.get("yaw"))
+        attacker_head = (
+            _num(attacker.get("pos_x")), _num(attacker.get("pos_y")),
+            _num(attacker.get("pos_z")),
+        )
+        target_head = (
+            _num(target.get("pos_x")), _num(target.get("pos_y")),
+            _num(target.get("pos_z")),
+        )
+        # 朝向锥：目标必须在大致前方（§11.3 第 2 条）
+        if not hitbox.facing_ok(attacker_yaw, attacker_head, target_head):
+            return {
+                "ok": False, "error": "目标不在攻击朝向内",
+                "code": "NOT_FACING", "distance": round(dist, 2),
+            }
+
+        # 到这里就算真挥了一刀：MISS 也吃冷却
         attacker["attack_at"] = now
-        attacker["yaw"] = _yaw_towards(attacker, target)
         attacker["rev"] = int(attacker.get("rev", 0)) + 1
         attacker["updated_at"] = now
         if _is_dying(target):
             return {"ok": False, "error": "目标已濒死"}
 
-        target["hp"] = max(0.0, _num(target.get("hp"), 100.0) - ATTACK_DAMAGE)
+        hit = hitbox.resolve_hit(
+            attacker_head, attacker_yaw, target_head,
+            _norm_yaw(target.get("yaw")), ATTACK_RANGE,
+        )
+        if hit is None:
+            bump_players_rev()      # attack_at / rev 已变，通知拉取方
+            return {
+                "ok": False, "error": "没有打中身体",
+                "code": "MISS", "distance": round(dist, 2),
+            }
+        part, multiplier, hit_t = hit
+        damage = hitbox.damage_for(multiplier, ATTACK_DAMAGE)
+
+        target["hp"] = max(0.0, _num(target.get("hp"), 100.0) - damage)
         target["last_attacker"] = attacker_id
         target["rev"] = int(target.get("rev", 0)) + 1
         target["updated_at"] = now
@@ -809,12 +987,17 @@ def attack(attacker_id: str, target_id: str, now: float | None = None) -> dict:
         result = {
             "ok": True,
             "target": target_id,
-            "damage": ATTACK_DAMAGE,
+            "part": part,
+            "multiplier": multiplier,
+            "damage": damage,
             "hp": target["hp"],
             "hp_max": _num(target.get("hp_max"), 100.0),
             "dying": _is_dying(target),
             "dying_remaining": DYING_SECONDS if _is_dying(target) else 0.0,
             "distance": round(dist, 2),
+            "hit_t": round(hit_t, 3),
+            "killer_red": bool(attacker.get("red_name")),
+            "victim_red": bool(target.get("red_name")),
             "attack_at": now,
         }
     bump_players_rev()
@@ -868,12 +1051,6 @@ def revive(healer_id: str, target_id: str, now: float | None = None) -> dict:
     return result
 
 
-def _yaw_towards(src: dict, dst: dict) -> float:
-    dx = _num(dst.get("pos_x")) - _num(src.get("pos_x"))
-    dz = _num(dst.get("pos_z")) - _num(src.get("pos_z"))
-    return _norm_yaw(math.degrees(math.atan2(dx, -dz)))
-
-
 def settle_all(now: float | None = None) -> int:
     """推进所有缓存玩家的计时器（灵力小时结算 / 濒死 / 旁观到期）。
 
@@ -885,11 +1062,11 @@ def settle_all(now: float | None = None) -> int:
     with mutate():
         for uid, row in players.items():
             before = (row.get("spirit"), row.get("level"), row.get("death_at"),
-                      row.get("spectator_until"), row.get("hp"))
+                      row.get("spectator_until"), row.get("hp"), row.get("red_name"))
             spirit_changed = _tick_spirit(row, now)
             _resolve_timers(row, now)
             after = (row.get("spirit"), row.get("level"), row.get("death_at"),
-                     row.get("spectator_until"), row.get("hp"))
+                     row.get("spectator_until"), row.get("hp"), row.get("red_name"))
             if spirit_changed or before != after:
                 row["rev"] = int(row.get("rev", 0)) + 1
                 row["updated_at"] = now
@@ -1099,7 +1276,11 @@ def load_from_store(store) -> bool:
 
     * 世界元信息 + 世界实体全部读回；
     * 玩家全部读回，但 ``online`` 一律强制 False（重启后没人在线）；
-    * 内存里的行级 ``rev`` 全部继承库里的值，下次写入才能正确地只接受领先数据。
+    * 内存里的行级 ``rev`` 全部继承库里的值，下次写入才能正确地只接受领先数据；
+    * **坐标基准迁移**（protocol.md §11.1）：``coord_base='feet'`` 的旧行在这里
+      一次性 +1.65m 改写为 ``'head'``，并把 rev 抬高一格让它成为「脏行」，
+      下一轮 ``save()`` / autosave 就把 ``coord_base='head'`` 与新坐标写回库。
+      迁移是幂等的：已经是 head 的行不动。
     """
     global _world_rev, _players_rev
     global _persisted_world_rev
@@ -1121,6 +1302,8 @@ def load_from_store(store) -> bool:
 
     world_row = world_data.get("world") or {}
     item_rows = world_data.get("items") or []
+    ## 本次启动从 feet 迁到 head 的玩家（这些行要尽快写回库）
+    migrated: list[str] = []
 
     with mutate():
         world.clear()
@@ -1154,8 +1337,14 @@ def load_from_store(store) -> bool:
 
         for row in player_rows:
             new_row = _normalize_player_row(row)
-            if new_row is not None:
-                players[new_row["user_id"]] = new_row
+            if new_row is None:
+                continue
+            if coord_base_of(row) == COORD_BASE_FEET:
+                # 库里的 rev 是旧基准那一版，+1 才能穿过 rev 门禁写回迁移结果
+                new_row["rev"] = int(new_row.get("rev") or 0) + 1
+                new_row["updated_at"] = time.time()
+                migrated.append(new_row["user_id"])
+            players[new_row["user_id"]] = new_row
 
         _world_rev = max(
             [int(it.get("rev") or 0) for it in world.values()]
@@ -1173,7 +1362,15 @@ def load_from_store(store) -> bool:
         _persisted_player_revs.update(
             {uid: int(p.get("rev") or 0) for uid, p in players.items()}
         )
+        # 迁移过的行内存 rev 比库里大 1：把「已落库 rev」退回一格，让它进下一轮 save()
+        for uid in migrated:
+            _persisted_player_revs[uid] = int(_persisted_player_revs.get(uid, 0)) - 1
 
+    if migrated:
+        log.info(
+            "坐标基准迁移：%d 条旧行 feet → head（+%.2fm），下一轮落库写回库：%s",
+            len(migrated), HEAD_OFFSET_Y, ", ".join(migrated[:8]),
+        )
     log.info(
         "已从数据库载入权威数据：世界 %s（rev=%d）/ 实体 %d 个 / 玩家 %d 条",
         (world_meta.get(DEFAULT_WORLD) or {}).get("name") or DEFAULT_WORLD,

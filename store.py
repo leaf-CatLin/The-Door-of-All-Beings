@@ -51,6 +51,7 @@ PLAYER_COLUMNS = (
     "hp_max", "hp", "stamina_max", "stamina", "mana_max", "mana",
     "spirit", "level", "spirit_at", "death_at", "spectator_until",
     "last_attacker", "inventory", "kills", "deaths",
+    "red_name", "red_at", "coord_base",
     "rev",
 )
 ## world_item 表参与落库的字段
@@ -164,6 +165,9 @@ def player_params(row: dict) -> tuple:
         _json_text(row.get("inventory")),
         _int(row.get("kills")),
         _int(row.get("deaths")),
+        _bool(row.get("red_name")),
+        _num(row.get("red_at")) if row.get("red_at") is not None else None,
+        _text(row.get("coord_base"), "head") or "head",
         _int(row.get("rev")),
     )
 
@@ -284,12 +288,15 @@ _SAVE_PLAYER_SQL = """
         pos_x, pos_y, pos_z, yaw, state, online,
         hp_max, hp, stamina_max, stamina, mana_max, mana,
         spirit, level, spirit_at, death_at, spectator_until,
-        last_attacker, inventory, kills, deaths, rev, updated_at
+        last_attacker, inventory, kills, deaths,
+        red_name, red_at, coord_base, rev, updated_at
     ) VALUES (
-        %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s,
+        %s, %s, %s, %s, %s,
+        %s, %s, %s, %s, %s, %s,
         %s, %s, %s, %s, %s, %s,
         %s, %s, %s, %s, %s,
-        %s, %s, %s, %s, %s, now()
+        %s, %s, %s, %s,
+        %s, %s, %s, %s, now()
     )
     ON CONFLICT (user_id) DO UPDATE SET
         player_id     = COALESCE(NULLIF(EXCLUDED.player_id, ''), player.player_id),
@@ -317,6 +324,9 @@ _SAVE_PLAYER_SQL = """
         inventory     = EXCLUDED.inventory,
         kills         = EXCLUDED.kills,
         deaths        = EXCLUDED.deaths,
+        red_name      = EXCLUDED.red_name,
+        red_at        = EXCLUDED.red_at,
+        coord_base    = EXCLUDED.coord_base,
         rev           = EXCLUDED.rev,
         updated_at    = now()
     WHERE player.rev < EXCLUDED.rev
@@ -465,12 +475,14 @@ class PostgresStore(Store):
 
         用 upsert 而不是 UPDATE：首次登录时 player 行可能还没落库
         （注册后只在内存热缓存里，要等定时落库），否则这里会空转。
+        补出来的空行显式写 ``coord_base='head'``：它是服务端造的，坐标本来就是头部基准，
+        不能落到建表默认值 ``'feet'`` 上，否则下次加载会被当成旧行 +1.65m。
         """
         with self.db.conn() as conn, conn.cursor() as cur:
             cur.execute(
                 """
-                INSERT INTO player (user_id, file_hash, rev)
-                VALUES (%s, %s, 0)
+                INSERT INTO player (user_id, file_hash, coord_base, rev)
+                VALUES (%s, %s, 'head', 0)
                 ON CONFLICT (user_id) DO UPDATE SET
                     file_hash  = EXCLUDED.file_hash,
                     updated_at = now()
@@ -704,7 +716,12 @@ class MemoryStore(Store):
         with self._lock:
             row = self._players.get(user_id)
             if row is None:
-                self._players[user_id] = {"user_id": user_id, "file_hash": _text(file_hash), "rev": 0}
+                self._players[user_id] = {
+                    "user_id": user_id,
+                    "file_hash": _text(file_hash),
+                    "coord_base": "head",   # 服务端补的空行：坐标本来就是头部基准
+                    "rev": 0,
+                }
             elif not _text(row.get("file_hash")):
                 row["file_hash"] = _text(file_hash)
 

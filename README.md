@@ -1,19 +1,20 @@
 # 众生之门 TCP 游戏服（The Door of All Beings · Socket Server）
 
-TCP 游戏协议 + 账号 / 世界数据 + **数据库权威 + rev 门槛** + **四阶段启动（s1/s2/s3/s4）**。
+TCP 游戏协议 + 账号 / 世界数据 + **数据库权威 + rev 门槛** + **四阶段启动（s1/s2/s3/s4）**
++ **头部坐标基准 / 身体碰撞箱部位命中 / 红名（Karma）**。
 
 HTTP 发现接口已拆到独立组件 **`server`**（仓库 `server` 分支），两边互不依赖、可分别部署与重启。
 
 | 项 | 值 |
 |---|---|
-| 协议版本 | **1.3**（4 行竖线报文，长连接，会话 Token，**无主动推送（客户端拉取）**，头+正文联合哈希，支持批量多 action；兼容 v1.1/v1.2） |
-| 服务版本 | **4.0.0** |
+| 协议版本 | **1.4**（4 行竖线报文，长连接，会话 Token，**无主动推送（客户端拉取）**，头+正文联合哈希，支持批量多 action，头部坐标基准 + 部位命中 + 红名；兼容 v1.0~v1.3） |
+| 服务版本 | **4.1.0** |
 | TCP 游戏端口 | `TCP_PORT`（默认跟随 `PORT`，即 **5423**） |
 | 存储 | PostgreSQL（生产）/ 内存（调试与测试） |
 | 依赖 | Python 3.12 · psycopg2-binary · python-dotenv |
 
-协议细节全部在 **[`protocol.md`](protocol.md)**（客户端对接看那一份就够），
-业务流程（注册 / 登录 / 下线 / 宽限期重连）在 **[`flows.md`](flows.md)**。
+协议细节全部在 **[`protocol.md`](protocol.md)**（客户端对接看那一份就够，§11 坐标/碰撞箱、§12 红名是冻结契约），
+业务流程（注册 / 登录 / 下线 / 宽限期重连 / 生死流转）在 **[`flows.md`](flows.md)**。
 
 ---
 
@@ -72,11 +73,13 @@ server-socket/
 ├─ actions.py       动作注册表（@action），业务入口
 ├─ users.py         账号业务：设备登记 / 注册 / 登录
 ├─ device_id.py     设备 ID 的签发与无状态校验（HMAC）
-├─ game.py          热缓存：世界物品 + 玩家行（rev 逐行递增），增量落库
+├─ game.py          热缓存：世界物品 + 玩家行（rev 逐行递增），战斗 / 生死 / 红名结算，增量落库
+├─ hitbox.py        身体碰撞箱（11 个盒子 + 射线-旋转 AABB slab 测试 + 60° 朝向锥）
+├─ karma.py         红名判定（人类 × 同势力人类 → 变红；豁免条件留参）
 ├─ store.py         存储抽象：PostgresStore / MemoryStore（rev 门槛在这里）
 ├─ anticheat.py     防外挂框架（目前 0 条规则，只占位不起线程）
 ├─ db.py            PostgreSQL 连接池 + 自动执行 schema.sql
-├─ schema.sql       表结构（幂等，可重复执行）
+├─ schema.sql       表结构（v4：幂等，可重复执行）
 ├─ protocol.md      协议规范（客户端对接看这份）
 ├─ flows.md         业务流程规范（5 大流程与服务端动作顺序）
 ├─ deploy/          systemd 示例
@@ -95,7 +98,7 @@ server-socket/
 
 ```bash
 # 协议全链路（内存后端，起真 TCP，不用数据库）
-uv run scripts/tcp_smoke_test.py          # 当前 110/110
+uv run scripts/tcp_smoke_test.py          # 当前 219/219
 uv run scripts/tcp_smoke_test.py -v       # 逐条打印
 
 # PostgreSQL 存储层（用真库，但只碰自己造的临时数据，跑完清理）
@@ -108,7 +111,10 @@ uv run main.py check
 `tcp_smoke_test.py` 覆盖：hello 下发 Token / 握手 / 联合哈希篡改（改头部即失效）/ v1.2 向后兼容 /
 批量多 action / 设备签发与确认 / 名称查重 / 注册（带客户端 player_id UUID）/ 登录（含 file_hash 三态）/
 重放去重 / 时间戳过期 / 未知动作 / 设备伪造 / 拉取式 peers & world（无 PUSH）/ 双客户端同屏 /
-正常下线完整拆除 / 意外断开宽限期（期内重连不丢位置）/ 宽限期超时落库销毁（靠 peers 感知，无 leave 广播）。
+正常下线完整拆除 / 意外断开宽限期（期内重连不丢位置）/ 宽限期超时落库销毁（靠 peers 感知，无 leave 广播）/
+**v1.4**：hello 的 `coord_base`/`hitboxes`/`attack_cone_deg`、部位命中（头部 50 / 躯干 25）、
+`MISS` / `NOT_FACING` / `OUT_OF_RANGE`、红名可见（`state.red` / `peers[].red`）、
+真死亡后击杀者变红 + 受害者清红名、legacy(0.1.0) 脚底坐标 ±1.65m 换算、`coord_base='feet'` 旧行迁移（含幂等）。
 
 `store_check.py` 覆盖：users 唯一冲突归类（设备 / user_id / user_name）、SAVEPOINT 回滚不污染事务、
 登录查询与活跃时间、world + world_item 落库与 **rev 门槛三态**（落后被拒 / 相等被拒 / 领先写入）、
@@ -161,17 +167,20 @@ player 三围 + rev 门槛 + JOIN 带回账号名、`mark_all_offline`。
 
 ---
 
-## 7. 数据模型（数据库 v2）
+## 7. 数据模型（数据库 v4）
 
 只有四张表，**库是唯一权威**。
 
 | 表 | 主键 | 说明 |
 |---|---|---|
 | `users` | `device_id` | 设备 + 账号。`user_id` / `user_name` 未注册时为 `NULL`（PG 的 UNIQUE 允许多个 NULL） |
-| `player` | `user_id` | 玩家数据，**一条玩家一行**：`player_id`（客户端 UUID）/ `file_hash`（登录文件校验）/ 名字 / 种族 / 坐标 / 朝向 / 在线 / 三围（`hp` / `stamina` / `mana` 及各自 `_max`） |
+| `player` | `user_id` | 玩家数据，**一条玩家一行**：`player_id`（客户端 UUID）/ `file_hash`（登录文件校验）/ 名字 / 种族 / 坐标（**头部中心**）/ 朝向 / 在线 / 三围（`hp` / `stamina` / `mana` 及各自 `_max`）/ 灵力等级 / 生死计时 / 红名（`red_name` / `red_at`）/ 坐标基准（`coord_base`） |
 | `world` | `id` | 世界元信息：名称 / 随机种子，默认一行 `default` = 众生之门 |
 | `world_item` | `id` | 世界实体（门 / 箱子 / 杆…），`world_id` 外键 |
 
+- v4 新增（全部幂等 `ALTER TABLE ... ADD COLUMN IF NOT EXISTS`，可反复跑）：
+  `player.red_name BOOLEAN NOT NULL DEFAULT FALSE`、`player.red_at DOUBLE PRECISION`、
+  `player.coord_base TEXT NOT NULL DEFAULT 'feet'`（旧行由此标记为脚底基准，加载时一次性迁移为 `'head'`）。
 - `admin` 表**暂不建**，只在 `schema.sql` 末尾留了设计注释（`admin_id` / `pass_hash` / `role` + 审计表）。
 - 表名用 `users` 而不是 `user`（`user` 是 PG 保留字）。
 - 每张业务表都带 `rev BIGINT`：**行级修订号**，既是增量落库的依据，也是冲突仲裁的依据。
@@ -250,6 +259,35 @@ WHERE player.rev < EXCLUDED.rev
 `ReplayGuard` 按「会话 + 时间戳 + 正文 sha256」去重，只拦 `register` / `device` / `item` 这类写动作。
 **跨连接重放挡不住**——协议目前没有 nonce 字段。详见 `protocol.md` §9。
 
+### 8.6 坐标基准 / 身体碰撞箱 / 红名（v1.4）
+
+**坐标基准（protocol.md §11.1）**
+
+- 内存与数据库里的 `pos_*` 一律是**头部中心**；脚底 = 头部 − `HEAD_OFFSET_Y`（1.65m）。
+- `session.Session.coord_base` 按连接判定：`client_version >= 0.2.0` → `head`；
+  更老或为空 → `feet`（`hello | head` / `hello | coord_base=feet` 可显式覆盖）。
+- `actions.handle_state` 按该基准把上报的 `y` **+1.65m** 换成头部再入库；
+  `state` / `peers` / `login` 下发时再 **−1.65m** 换回脚底（旧客户端往返一致）。
+- 库里 `coord_base='feet'` 的旧行在 `game.load_from_store` / `_normalize_player_row` 时一次性 +1.65m
+  并改写为 `'head'`，`rev` 抬高一格，下一轮 autosave 写回（幂等；重复加载不会再平移）。
+
+**身体碰撞箱（protocol.md §11.2 / §11.3）**
+
+- `hitbox.HUMAN_BODY`：11 个相对头部中心的盒子（`head` ×2.0 / `neck` ×1.5 / `torso` ×1.0 /
+  `upper_arm_*` ×0.6 / `forearm_*` ×0.5 / `thigh_*` ×0.8 / `shin_*` ×0.6）。
+- `hitbox.resolve_hit`：射线原点 = 攻击者头部，方向 = 攻击者 `yaw` 的水平前向；
+  变换到目标局部系后对 11 个 AABB 做 slab 测试，取 `t` 最小者。伤害 = `25 × 倍率`（取整到 0.1）。
+- 朝向锥 60°（`hitbox.facing_ok`）不过 → `NOT_FACING`；射程内没打到盒子 → `MISS`；超 3m → `OUT_OF_RANGE`。
+- 服务端**不再自动把攻击者转向目标**：`yaw` 以客户端最近一次 `state` 上报为准。
+
+**红名（protocol.md §12）**
+
+- `karma.should_become_red(killer, victim)`：人类 × 同势力人类 → `True`；
+  不同势力 / 非人类 / BOSS 身份击杀 → `False`（字段取不到就落默认值，所以本期人类杀人类必触发）。
+- 结算时点 = 濒死 5 秒窗口结束判**真死亡**的那一刻（`game._resolve_timers` 的 `died` 分支）：
+  击杀者 `red_name=True` / `red_at=now`，受害者 `red_name=False`；`revive` 成功则两边都不动。
+- 惩罚本期只做到"标记"：`state.red` / `peers[].red` 给客户端标红，没有任务系统、也不加攻击限制。
+
 ---
 
 ## 9. 部署
@@ -304,6 +342,20 @@ ufw allow 5423/tcp
 | 冒烟测试 | 75 项 | **110 项**（含宽限期与重连接管用例） |
 
 > 客户端（`game/code/net/`）本轮**不动**：v1.2 服务端仍接受 v1.1 报文，接上 token 后才拿到新能力。
+
+### 10.2 4.1.0 的变化（协议 v1.3 → v1.4，只加语义）
+
+| 方面 | v1.3（4.0.0） | v1.4（4.1.0） |
+|---|---|---|
+| 坐标基准 | 脚底（隐含） | **头部中心**；旧客户端由服务端自动 ±1.65m 换算，库用 `coord_base` 标记并一次性迁移 |
+| 攻击判定 | 固定 25 伤害 | **11 个身体盒 + 部位倍率**（头 50 / 颈 37.5 / 躯干 25 …），伤害取整到 0.1 |
+| 攻击方向 | 服务端自动把攻击者转向目标 | 用攻击者上报的 `yaw` 做 60° 朝向锥校验，不再自动转向 |
+| 错误码 | — | 新增 `OUT_OF_RANGE` / `NOT_FACING` / `MISS` |
+| 红名 | — | `player.red_name` / `red_at`，真死亡时结算；`state.red` / `peers[].red` |
+| 协议版本 | `1.3` | `1.4`（报文结构、联合哈希、批量规则与 1.3 完全相同） |
+| 冒烟测试 | 153 项 | **219 项**（新增部位命中 / 三种失败 / 红名 / 坐标换算 / 迁移） |
+
+> 冻结契约在 `protocol.md` §11 / §12：字段名、11 个盒子的数值、倍率、错误码都不要改，改动先改文档。
 
 ---
 

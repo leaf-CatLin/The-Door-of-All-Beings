@@ -1,4 +1,4 @@
--- 众生之门 —— 数据库结构（v3：新增灵力 / 等级 / 生死流转 / 背包）
+-- 众生之门 —— 数据库结构（v4：新增红名 / 坐标基准；v3 曾加灵力 / 等级 / 生死流转 / 背包）
 --
 -- ===========================================================================
 -- 三条铁律
@@ -54,10 +54,15 @@ ALTER TABLE users ADD COLUMN IF NOT EXISTS last_login_at  TIMESTAMPTZ;
 -- ---------------------------------------------------------------------------
 -- 二，player：玩家数据
 --   位置是「最后落库的位置」，不是实时的；实时位置在内存 + PUSH 里。
+--   **坐标基准 = 头部中心**（protocol.md §11.1）：pos_* 是头部中心的世界坐标，
+--   脚底 = pos_y - 1.65。旧客户端（v0.1.x）按脚底上报，服务端在加载 / 上报时换算。
 --   online 只是落库那一刻的快照值：服务启动时会被统一清成 FALSE，
 --   因为进程重启后其实没有任何人在线。
 --   三围（生命 / 体力 / 灵力）同时存上限和当前值，上限由种族成长决定、
 --   当前值由战斗 / 消耗决定，二者必须分开存。
+--   红名（protocol.md §12）：red_name 为标记，red_at 为变红时间（审计用）。
+--   coord_base 记录「这一行是按哪种基准写的」：'feet' = 旧行（加载时一次性 +1.65 并
+--   改写为 'head'），'head' = 已迁移。
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS player (
     user_id     TEXT PRIMARY KEY REFERENCES users (user_id) ON DELETE CASCADE,
@@ -65,7 +70,7 @@ CREATE TABLE IF NOT EXISTS player (
     file_hash   TEXT NOT NULL DEFAULT '',                 -- 登录校验文件哈希（首次登录时初始化）
     player_name TEXT NOT NULL DEFAULT '',                 -- 角色名（游戏内显示）
     race        TEXT NOT NULL DEFAULT 'human',            -- 种族
-    pos_x       DOUBLE PRECISION NOT NULL DEFAULT 0,      -- 最后落库的世界坐标
+    pos_x       DOUBLE PRECISION NOT NULL DEFAULT 0,      -- 最后落库的世界坐标（头部中心）
     pos_y       DOUBLE PRECISION NOT NULL DEFAULT 0,
     pos_z       DOUBLE PRECISION NOT NULL DEFAULT 0,
     yaw         DOUBLE PRECISION NOT NULL DEFAULT 0,      -- 朝向（度，0 = 正北 / -Z）
@@ -86,6 +91,9 @@ CREATE TABLE IF NOT EXISTS player (
     inventory   JSONB NOT NULL DEFAULT '{}'::jsonb,       -- 背包（暂无 UI，先存空对象）
     kills       INTEGER NOT NULL DEFAULT 0,               -- 击杀数
     deaths      INTEGER NOT NULL DEFAULT 0,               -- 死亡数
+    red_name    BOOLEAN NOT NULL DEFAULT FALSE,           -- 红名标记（§12）
+    red_at      DOUBLE PRECISION,                         -- 变红时间（epoch 秒；NULL = 未变红）
+    coord_base  TEXT NOT NULL DEFAULT 'feet',             -- 坐标基准：feet（旧行）/ head（已迁移）
     rev         BIGINT NOT NULL DEFAULT 0,                -- 修订号：只有更大才能覆盖
     updated_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -107,6 +115,12 @@ ALTER TABLE player ADD COLUMN IF NOT EXISTS last_attacker TEXT NOT NULL DEFAULT 
 ALTER TABLE player ADD COLUMN IF NOT EXISTS inventory   JSONB NOT NULL DEFAULT '{}'::jsonb;
 ALTER TABLE player ADD COLUMN IF NOT EXISTS kills       INTEGER NOT NULL DEFAULT 0;
 ALTER TABLE player ADD COLUMN IF NOT EXISTS deaths      INTEGER NOT NULL DEFAULT 0;
+-- v4：红名（§12）与坐标基准（§11.1）。
+-- coord_base 的默认值是 **'feet'**：老库里的行都是脚底基准，加载时由 game._normalize_player_row
+-- 一次性 +1.65m 并改写成 'head'（幂等，已迁移的行不会再动）。
+ALTER TABLE player ADD COLUMN IF NOT EXISTS red_name    BOOLEAN NOT NULL DEFAULT FALSE;
+ALTER TABLE player ADD COLUMN IF NOT EXISTS red_at      DOUBLE PRECISION;
+ALTER TABLE player ADD COLUMN IF NOT EXISTS coord_base  TEXT NOT NULL DEFAULT 'feet';
 ALTER TABLE player ADD COLUMN IF NOT EXISTS rev         BIGINT NOT NULL DEFAULT 0;
 
 

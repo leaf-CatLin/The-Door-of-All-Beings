@@ -283,13 +283,23 @@
 **死亡**
 1. `attack` 把目标 HP 打到 0 → `death_at = now`，进入**濒死**（5 秒窗口）。客户端原地冻结，
    其他人仍能在 `peers` 里看到他（`dying=true`）。
-2. 5 秒内 `revive` 成功 → 清空 `death_at`，恢复到 30% 生命，击杀归属作废。
+   伤害按命中部位算（`hitbox.resolve_hit`）：射线从攻击者头部沿其 `yaw` 前向发出，
+   穿过目标 11 个身体盒中 `t` 最小的那个，伤害 = `25 × 倍率`（头 50 / 颈 37.5 / 躯干 25 …）；
+   朝向锥不过 → `NOT_FACING`，射程内没打到盒子 → `MISS`，超距 → `OUT_OF_RANGE`。
+2. 5 秒内 `revive` 成功 → 清空 `death_at`，恢复到 30% 生命，击杀归属作废；**红名不动**。
 3. 5 秒内没有任何治疗 → 判定死亡：`deaths + 1`、`spectator_until = now + 30min`、
    HP 固定 0、状态 `dead`；击杀者按上面的比例拿灵力并 `kills + 1`。
+   **同一时点结算红名**（protocol.md §12）：击杀者 `red_name = True`（`red_at = now`），
+   受害者 `red_name = False`（确认死亡是唯一的解除途径）。
 4. 旁观期间：**无实体**——不出现在 `peers`，客户端可自由飞行、不受物理影响；
    服务端冻结其坐标（不接收客户端上报的飞行位置），死亡点即复活点。
 5. 30 分钟到：`spirit = 0`、`inventory = {}`、HP 回满、状态 `idle`，原地复活并结束旁观；
    客户端收到 `spectating=false` 后传送到服务端给的 `pos_*`。
+
+**坐标基准**（protocol.md §11.1）
+- 协议与库里所有 `pos_*` 都是**头部中心**；脚底 = 头部 − 1.65m。
+- `client_version >= 0.2.0` 的连接按头部收发；更老的连接服务端自动 +1.65m 入库、−1.65m 下发。
+- 库里 `coord_base='feet'` 的旧行在加载时一次性 +1.65m 并改写为 `'head'`（幂等，下一轮落库写回）。
 
 定时器由 `game.start_timers()`（每秒）驱动，`main.py` 在 s2 启动、s4 关闭；
 任何写库仍走 `rev` 门禁，`autosave` 负责落库。
