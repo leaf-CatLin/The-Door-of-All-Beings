@@ -16,9 +16,9 @@ const TELEPORT_COOLDOWN := 1.2
 ## 掉到这个高度以下就送回本界落点。
 const FALL_LIMIT := -40.0
 
-const HINT_TEXT := "WASD 移动   ·   Shift 疾行   ·   空格 跳跃   ·   走近光柱进入门内世界（单向）   ·   Esc 释放鼠标   ·   R 复位   ·   F3 调试面板（帧率 / 延迟 / 坐标）   ·   H 关闭本说明"
+const HINT_TEXT := "WASD 移动   ·   Shift 疾行   ·   空格 跳跃   ·   左键 攻击   ·   E 复活濒死者   ·   走近光柱进入门内世界（单向）   ·   Esc 释放鼠标   ·   R 复位   ·   F3 调试面板   ·   H 关闭本说明"
 ## 触屏平台的提示文案（与键鼠不同源，没有 Esc / F3 / H 这些键盘操作）。
-const HINT_TEXT_TOUCH := "左侧拖动移动（推到底疾行）　·　右侧拖动转向　·　右下跳跃　·　走近光柱入门（单向）"
+const HINT_TEXT_TOUCH := "左侧拖动移动（推到底疾行）　·　右侧拖动转向　·　右下跳跃　·   轻点屏幕 攻击　·　走近光柱入门（单向）"
 
 ## 万一 project.godot 里的输入动作丢了，运行时补一份，保证一定操作得起来。
 const FALLBACK_ACTIONS := {
@@ -53,7 +53,7 @@ var _speed_accum: float = 0.0
 func _process(delta: float) -> void:
 	_cooldown = maxf(_cooldown - delta, 0.0)
 
-	if _player != null and _player.global_position.y < FALL_LIMIT:
+	if _player != null and _player.global_position.y < FALL_LIMIT and not bool(_player.spectating):
 		_respawn()
 
 	# 调试面板的读数每 0.1 秒刷一次就够了，别每帧都拼字符串。
@@ -67,6 +67,25 @@ func _process(delta: float) -> void:
 			_hud.set_speed(_player.get_horizontal_speed())
 			_hud.set_coords(_player.global_position)
 			_hud.set_facing(_player.get_yaw_degrees())
+		_refresh_life_hud()
+
+
+## 把服务端权威的血量 / 灵力 / 等级 / 生死倒计时刷到 HUD。
+func _refresh_life_hud() -> void:
+	if _net_sync == null or _hud == null or not _hud.has_method("set_life"):
+		return
+	if not _net_sync.has_method("self_state"):
+		return
+	var st: Dictionary = _net_sync.call("self_state")
+	if st.is_empty():
+		return
+	_hud.call(
+		"set_life",
+		float(st.get("hp", 0.0)), float(st.get("hp_max", 100.0)),
+		float(st.get("spirit", 0.0)), int(st.get("level", 1)),
+		int(st.get("kills", 0)), int(st.get("deaths", 0)),
+		float(st.get("dying_remaining", 0.0)), float(st.get("spectator_remaining", 0.0))
+	)
 
 
 func _unhandled_input(event: InputEvent) -> void:
@@ -79,10 +98,22 @@ func _unhandled_input(event: InputEvent) -> void:
 		# 触屏平台不做鼠标捕获（触摸会被模拟成鼠标点击，误触发捕获）。
 		if _touch == null:
 			var click := event as InputEventMouseButton
-			if click.pressed and Input.mouse_mode != Input.MOUSE_MODE_CAPTURED:
-				Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
-				get_viewport().set_input_as_handled()
+			if click.pressed:
+				if Input.mouse_mode == Input.MOUSE_MODE_CAPTURED:
+					if click.button_index == MOUSE_BUTTON_LEFT:
+						_try_attack()
+						get_viewport().set_input_as_handled()
+				else:
+					Input.mouse_mode = Input.MOUSE_MODE_CAPTURED
+					get_viewport().set_input_as_handled()
 		return
+
+	if event is InputEventKey:
+		var key := event as InputEventKey
+		if key.pressed and not key.echo and key.physical_keycode == KEY_E:
+			_try_revive()
+			get_viewport().set_input_as_handled()
+			return
 
 	if event.is_action_pressed("reset_player"):
 		_respawn()
@@ -94,6 +125,26 @@ func _latency_ms() -> float:
 	if _net_sync == null or not _net_sync.has_method("latency_ms"):
 		return -1.0
 	return float(_net_sync.call("latency_ms"))
+
+
+## 左键攻击最近的玩家（濒死 / 旁观时不允许行动）。
+func _try_attack() -> void:
+	if _net_sync == null or _player == null:
+		return
+	if bool(_player.frozen) or bool(_player.spectating):
+		return
+	if _net_sync.has_method("attack_nearest"):
+		_net_sync.call("attack_nearest")
+
+
+## E 复活最近的濒死玩家（5 秒窗口内）。
+func _try_revive() -> void:
+	if _net_sync == null or _player == null:
+		return
+	if bool(_player.frozen) or bool(_player.spectating):
+		return
+	if _net_sync.has_method("revive_nearest"):
+		_net_sync.call("revive_nearest")
 
 
 ## 送回本界落点（掉出去或按 R 时用）。子类可通过覆写 _respawn 改成“按坐标落点”。

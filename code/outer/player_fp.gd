@@ -17,11 +17,20 @@ extends CharacterBody3D
 @export var touch_sensitivity: float = 0.0035
 @export var pitch_limit_degrees: float = 85.0
 
+@export_group("旁观 Spectator")
+## 旁观状态下的飞行速度（无实体、不受物理影响）。
+@export var spectator_speed: float = 12.0
+
 const MAX_FALL_SPEED := 60.0
 
 @onready var _head: Node3D = $Head
 
 var _pitch_degrees: float = 0.0
+
+## 濒死：原地冻结，等 5 秒窗口内的复活治疗。
+var frozen: bool = false
+## 旁观：无实体、可自由飞行、不受物理影响（死亡 30 分钟窗口）。
+var spectating: bool = false
 
 ## 触屏控制层（方案B）。故意不写类型标注：它是自定义脚本，静态类型成 Node 会报找不到成员。
 ## 仅在移动端 / 触屏设备由 world_base.gd 注入；为 null 时本脚本完全按键鼠走。
@@ -53,6 +62,15 @@ func _apply_look(delta_x: float, delta_y: float, sensitivity: float) -> void:
 
 
 func _physics_process(delta: float) -> void:
+	# 旁观优先：无实体、不受物理影响，只按输入自由飞行
+	if spectating:
+		_fly(delta)
+		return
+	# 濒死：原地冻结（仍然接受视角输入，看起来像倒地）
+	if frozen:
+		velocity = Vector3.ZERO
+		return
+
 	var input_dir := Input.get_vector("move_left", "move_right", "move_forward", "move_back")
 	var sprint := Input.is_action_pressed("sprint")
 	# 触屏激活时用摇杆轴覆盖键盘（移动平台上没有键盘），推满行程即疾行。
@@ -80,6 +98,46 @@ func _physics_process(delta: float) -> void:
 		velocity.y = maxf(velocity.y - gravity * delta, -MAX_FALL_SPEED)
 
 	move_and_slide()
+
+
+## 旁观飞行：Space 上升、Shift 下降，水平方向沿用移动输入，不落地、不碰撞。
+func _fly(delta: float) -> void:
+	var input_dir := Input.get_vector("move_left", "move_right", "move_forward", "move_back")
+	if touch_controls != null:
+		input_dir = touch_controls.move_axis
+	var direction := Vector3(input_dir.x, 0.0, input_dir.y)
+	if direction.length_squared() > 1.0:
+		direction = direction.normalized()
+	direction = transform.basis * direction
+	direction.y = 0.0
+
+	var vertical := 0.0
+	if Input.is_action_pressed("jump") or _wants_touch_jump():
+		vertical += 1.0
+	if Input.is_action_pressed("sprint"):
+		vertical -= 1.0
+
+	global_position += (direction + Vector3.UP * vertical) * spectator_speed * delta
+	velocity = Vector3.ZERO
+
+
+## 濒死冻结开关（服务端判定）。
+func set_frozen(enabled: bool) -> void:
+	frozen = enabled
+	if enabled:
+		velocity = Vector3.ZERO
+
+
+## 旁观开关（服务端判定）。旁观时关闭胶囊碰撞，避免被地形 / 物理卡住。
+func set_spectator(enabled: bool) -> void:
+	if spectating == enabled:
+		return
+	spectating = enabled
+	velocity = Vector3.ZERO
+	frozen = false
+	var shape := get_node_or_null("CollisionShape3D")
+	if shape is CollisionShape3D:
+		(shape as CollisionShape3D).disabled = enabled
 
 
 ## 传送到某个落点：位置取 spawn 的原点，朝向取 spawn 的 -Z 方向，俯仰归零。

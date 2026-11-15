@@ -44,6 +44,13 @@ var file_hash := ""
 
 ## 最近一次 `state` 响应回写的行修订号（服务端的 player.rev）。
 var state_rev := 0
+
+## 服务端权威自身状态（state 响应）：hp / hp_max / spirit / level / kills / deaths /
+## dying / dying_remaining / spectating / spectator_remaining。HUD 与濒死/旁观逻辑都读这里。
+var self_state: Dictionary = {}
+
+## 服务端下发的可用种族（races 动作），每项 {key, name, dev_only}。
+var races: Array = []
 ## 上一次 `world` 拉到的世界元信息与修订号（服务端新增的 `world` 字段）。
 var world_meta: Dictionary = {}
 var world_rev := 0
@@ -405,6 +412,45 @@ func apply_state_response(res: Dictionary) -> void:
 		return
 	var data: Dictionary = res.get("data", {})
 	state_rev = int(data.get("rev", state_rev))
+	if not data.has("hp"):
+		return
+	self_state = {
+		"hp": float(data.get("hp", 0.0)),
+		"hp_max": float(data.get("hp_max", 100.0)),
+		"spirit": float(data.get("spirit", 0.0)),
+		"level": int(data.get("level", 1)),
+		"kills": int(data.get("kills", 0)),
+		"deaths": int(data.get("deaths", 0)),
+		"dying": bool(data.get("dying", false)),
+		"dying_remaining": float(data.get("dying_remaining", 0.0)),
+		"spectating": bool(data.get("spectating", false)),
+		"spectator_remaining": float(data.get("spectator_remaining", 0.0)),
+		"pos_x": float(data.get("pos_x", 0.0)),
+		"pos_y": float(data.get("pos_y", 0.0)),
+		"pos_z": float(data.get("pos_z", 0.0)),
+		"yaw": float(data.get("yaw", 0.0)),
+	}
+
+
+## 取服务端裁定的可用种族（race.tscn 用；不需要登录）。
+func fetch_races() -> Dictionary:
+	var res: Dictionary = await _call("races")
+	if bool(res.get("ok", false)):
+		var data: Dictionary = res.get("data", {})
+		var list: Variant = data.get("races", [])
+		if typeof(list) == TYPE_ARRAY:
+			races = list
+	return res
+
+
+## 近战攻击（服务端判定射程 / 冷却 / 伤害）。成功时 data 里有目标血量与濒死状态。
+func attack(target_user_id: String) -> Dictionary:
+	return await _call("attack", target_user_id.strip_edges())
+
+
+## 复活类治疗：把濒死窗口里的队友拉起来。
+func revive(target_user_id: String) -> Dictionary:
+	return await _call("revive", target_user_id.strip_edges())
 
 
 ## 拉一次在线玩家快照（v1.3：取代服务端 PUSH）。

@@ -40,6 +40,10 @@ const RECONNECT_WINDOW := 5.0
 ## 重连失败后的重试间隔（秒）。
 const RECONNECT_INTERVAL := 1.0
 
+## 近战 / 治疗的客户端侧距离上限（服务端会再判一次，这里只用来选目标）。
+const ATTACK_RANGE := 3.0
+const REVIVE_RANGE := 5.0
+
 ## 世界物品快照（首次拉取；v1.3 服务端不再推，后续变更重进世界时重拉）。
 signal world_items_received(items: Array)
 ## 世界元信息（服务端 `world` 响应新增的 `world` 字段：id / name / seed / rev）。
@@ -53,6 +57,11 @@ var _player: Node3D = null
 var _root: Node3D = null
 var _avatars: Dictionary = {}
 var _targets: Dictionary = {}
+## 远端玩家的原始行（peers 返回的字典），攻击 / 复活选目标用（含 dying / level）。
+var _peer_rows: Dictionary = {}
+## 上一次自我状态的生死档位，用来识别「旁观结束 / 濒死开始」这类跳变。
+var _was_spectating := false
+var _was_dying := false
 var _accum := 0.0
 var _peers_accum := 0.0
 var _busy := false
@@ -227,12 +236,49 @@ func _state_payload() -> String:
 ## 处理批量里 `state` 那一帧：只有「服务器不认我了」这一档值得动手，其余交给下一轮。
 func _on_state_result(res: Dictionary) -> void:
 	_api.apply_state_response(res)
-	if bool(res.get("ok", false)):
+	if not bool(res.get("ok", false)):
+		var code := str(res.get("code", ""))
+		if code == "NOT_AUTHENTICATED" or code == "DISCONNECTED" or code == "BAD_USER_ID":
+			push_warning("联机上报被拒：%s" % str(_api.explain(res, code)))
+			_api.set_authenticated(false)
 		return
-	var code := str(res.get("code", ""))
-	if code == "NOT_AUTHENTICATED" or code == "DISCONNECTED" or code == "BAD_USER_ID":
-		push_warning("联机上报被拒：%s" % str(_api.explain(res, code)))
-		_api.set_authenticated(false)
+	_apply_life_state()
+
+
+## 把服务端权威的生死状态映射到本机玩家：
+## 濒死 => 冻结原地等治疗；旁观 => 自由飞行（无实体、不受物理影响）；
+## 旁观结束（30 分钟到）=> 传送到服务端记录的死亡点并解除冻结。
+func _apply_life_state() -> void:
+	if _player == null or _api == null:
+		return
+	var st: Dictionary = _api.self_state
+	if st.is_empty():
+		return
+	var dying := bool(st.get("dying", false))
+	var spectating := bool(st.get("spectating", false))
+
+	if spectating and not _was_spectating:
+		if _player.has_method("set_spectator"):
+			_player.call("set_spectator", true)
+	elif not spectating and _was_spectating:
+		if _player.has_method("set_spectator"):
+			_player.call("set_spectator", false)
+		# 旁观结束：服务端把复活点冻结在死亡位置，客户端飞出去的身体要拉回来
+		if _player.has_method("teleport_to_point") and st.has("pos_x"):
+			var back := Vector3(
+				float(st.get("pos_x", 0.0)),
+				float(st.get("pos_y", 0.0)),
+				float(st.get("pos_z", 0.0)),
+			)
+			_player.call("teleport_to_point", back, float(st.get("yaw", 0.0)))
+
+	if not _player.has_method("set_frozen"):
+		_was_spectating = spectating
+		_was_dying = dying
+		return
+	_player.call("set_frozen", dying and not spectating)
+	_was_spectating = spectating
+	_was_dying = dying
 
 
 # ---------------------------------------------------------------- 远端代理
@@ -255,6 +301,7 @@ func _apply_players(payload: Dictionary) -> void:
 		if uid == "" or uid == str(_api.user_id):
 			continue
 		seen[uid] = true
+		_peer_rows[uid] = row
 		_targets[uid] = {
 			"pos": Vector3(
 				float(row.get("pos_x", 0.0)),
@@ -272,6 +319,9 @@ func _apply_players(payload: Dictionary) -> void:
 	for uid in _avatars.keys():
 		if not seen.has(uid):
 			_despawn_avatar(uid)
+	for uid in _peer_rows.keys():
+		if not seen.has(uid):
+			_peer_rows.erase(uid)
 
 
 func _spawn_avatar(uid: String) -> Node3D:
@@ -303,6 +353,9 @@ func _clear_avatars() -> void:
 	for uid in _avatars.keys():
 		_despawn_avatar(uid)
 	_targets.clear()
+	_peer_rows.clear()
+	_was_spectating = false
+	_was_dying = false
 	online_count = 0
 
 
@@ -371,3 +424,46 @@ func set_stats(new_hp: float, new_stamina: float, new_mana: float) -> void:
 	hp = clampf(new_hp, 0.0, DEFAULT_STAT)
 	stamina = clampf(new_stamina, 0.0, DEFAULT_STAT)
 	mana = clampf(new_mana, 0.0, DEFAULT_STAT)
+
+
+## 服务端权威自我状态（HUD 用）；未登录 / 尚无响应时为空字典。
+func self_state() -> Dictionary:
+	return {} if _api == null else _api.self_state
+
+
+## 攻击最近的玩家（客户端只负责选目标，射程 / 冷却 / 伤害由服务端判定）。
+func attack_nearest() -> void:
+	var target := _nearest_peer(ATTACK_RANGE, false)
+	if target == "":
+		return
+	_api.attack(target)
+
+
+## 复活最近的濒死玩家（5 秒窗口内、治疗距离内）。
+func revive_nearest() -> void:
+	var target := _nearest_peer(REVIVE_RANGE, true)
+	if target == "":
+		return
+	_api.revive(target)
+
+
+## 选出距离本机最近、且满足条件的目标 user_id；没有返回空串。
+func _nearest_peer(max_range: float, need_dying: bool) -> String:
+	if _api == null or not bool(_api.authenticated) or _player == null:
+		return ""
+	var best_uid := ""
+	var best_dist := max_range
+	for uid in _peer_rows.keys():
+		var row: Dictionary = _peer_rows[uid]
+		if need_dying and not bool(row.get("dying", false)):
+			continue
+		if not need_dying and bool(row.get("dying", false)):
+			continue
+		var target: Dictionary = _targets.get(uid, {})
+		if target.is_empty():
+			continue
+		var dist := _player.global_position.distance_to(target["pos"])
+		if dist <= best_dist:
+			best_dist = dist
+			best_uid = str(uid)
+	return best_uid
