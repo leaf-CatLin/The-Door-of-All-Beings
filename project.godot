@@ -26,6 +26,10 @@ GameTransition="*res://code/outer/game_transition.gd"
 window/stretch/mode="canvas_items"
 window/stretch/aspect="expand"
 
+[dotnet]
+
+project/assembly_name="TheDoorOfBings"
+
 [input]
 
 move_forward={
