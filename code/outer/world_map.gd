@@ -54,7 +54,18 @@ func height_at(local_x: float, local_z: float) -> float:
 		return 0.0
 	var i := clampi(int(round((local_x - _min_x) / SAMPLE_SPACING)), 0, _grid_w - 1)
 	var j := clampi(int(round((local_z - _min_z) / SAMPLE_SPACING)), 0, _grid_d - 1)
-	return _heights[i * _grid_d + j]
+	return _heights[_cell_index(i, j)]
+
+
+## 栅格单元 (i = X 方向, j = Z 方向) 在一维数组里的下标。
+##
+## **必须用 z-major（行优先）**：Godot 的 `HeightMapShape3D.map_data` 是
+## 「第 j 行、第 i 列」的排布，即 `idx = j * map_width + i`。
+## 早期这里写成 `i * _grid_d + j`（x-major），在这张 401×401 的方图上等价于
+## 把碰撞地形**沿对角线转置**——视觉上是山坡，踩上去是镜像出来的另一片高度，
+## 于是出现「人浮空 / 陷进地里 / 走不上斜坡」。已实测确认（见 commit 说明）。
+func _cell_index(i: int, j: int) -> int:
+	return j * _grid_w + i
 
 
 ## 给定世界坐标，返回其正下方的地面高度（世界 Y）。给摆放出生点 / 复位用。
@@ -88,9 +99,12 @@ func _load_map() -> bool:
 	return true
 
 
-## obj 没带材质（MTL 空文件 / 无 usemtl）时给一个中性灰材质兜底，
+## obj 没带材质（MTL 空文件 / 无 usemtl）时给一个中性材质兜底，
 ## 避免出现无材质表面在不同渲染后端下表现不一致（部分区域发黑或不显示）。
 ## 只补没有材质的表面，已经带材质的不动。
+##
+## 用**受光**材质而不是 unshaded：地形网格修好绕序后法线是朝上的，
+## 受光才能把山脊/沟谷的起伏显示出来；unshaded 会让整块地形变成一片死灰的平面。
 func _ensure_material(mesh: Mesh, visual: MeshInstance3D) -> void:
 	var any_material := false
 	for s in mesh.get_surface_count():
@@ -100,8 +114,11 @@ func _ensure_material(mesh: Mesh, visual: MeshInstance3D) -> void:
 	if any_material:
 		return
 	var mat := StandardMaterial3D.new()
-	mat.shading_mode = BaseMaterial3D.SHADING_MODE_UNSHADED
-	mat.albedo_color = Color(0.5, 0.52, 0.55)
+	mat.albedo_color = Color(0.46, 0.47, 0.44)
+	mat.roughness = 1.0
+	mat.metallic = 0.0
+	# 地形是单层壳：万一面片仍有漏反面，双面渲染保证不出现“看穿”的空白。
+	mat.cull_mode = BaseMaterial3D.CULL_DISABLED
 	# material_override 对全部表面生效，也不用担心表面数量。
 	visual.material_override = mat
 
@@ -163,7 +180,7 @@ func _build_height_collision(mesh: Mesh) -> bool:
 			var j := int(round((v.z - _min_z) / SAMPLE_SPACING))
 			if i < 0 or i >= _grid_w or j < 0 or j >= _grid_d:
 				continue
-			var idx := i * _grid_d + j
+			var idx := _cell_index(i, j)
 			if hit[idx] == 0 or v.y > _heights[idx]:
 				_heights[idx] = v.y
 			hit[idx] = 1
@@ -180,8 +197,9 @@ func _build_height_collision(mesh: Mesh) -> bool:
 	shape.map_data = _heights
 
 	# HeightMapShape3D 的采样点以节点原点为中心、间距 1m：格 (i,j) 位于
-	#   x = node.x + (i - W/2) * spacing。要让它对齐到 min_x + i*spacing，
-	#   就把节点放到 x = min_x + W/2*spacing（z 同理）。y=0（高度是绝对值）。
+	#   x = node.x + (i - (W-1)/2) * spacing（实测确认，不是 W/2）。
+	# 要让它对齐到 min_x + i*spacing，就把节点放到 x = min_x + (W-1)/2*spacing（z 同理）。
+	# 早期写成 W/2 会整体偏半格（0.5m），陡坡边缘会踩空或穿模。
 	var body := StaticBody3D.new()
 	body.name = "MapBody"
 	body.collision_layer = 1
@@ -190,9 +208,9 @@ func _build_height_collision(mesh: Mesh) -> bool:
 	cs.name = "MapCollision"
 	cs.shape = shape
 	cs.position = Vector3(
-		_min_x + float(_grid_w) * 0.5 * SAMPLE_SPACING,
+		_min_x + float(_grid_w - 1) * 0.5 * SAMPLE_SPACING,
 		0.0,
-		_min_z + float(_grid_d) * 0.5 * SAMPLE_SPACING,
+		_min_z + float(_grid_d - 1) * 0.5 * SAMPLE_SPACING,
 	)
 	body.add_child(cs)
 	add_child(body)
@@ -225,26 +243,27 @@ func _fill_gaps(hit: PackedByteArray) -> void:
 	if not has_gap:
 		return
 	# 有限次扩散填充（只从有邻居的格子向外蔓延，一次 8 轮足够盖住格网毛刺）。
+	# 邻居下标同样按 z-major：i±1 是 ±1，j±1 是 ±_grid_w。
 	for _pass in 8:
 		var changed := false
-		for i in _grid_w:
-			for j in _grid_d:
-				var idx := i * _grid_d + j
+		for j in _grid_d:
+			for i in _grid_w:
+				var idx := _cell_index(i, j)
 				if hit[idx] != 0:
 					continue
 				var sum := 0.0
 				var cnt := 0
-				if i > 0 and hit[idx - _grid_d] != 0:
-					sum += _heights[idx - _grid_d]
-					cnt += 1
-				if i < _grid_w - 1 and hit[idx + _grid_d] != 0:
-					sum += _heights[idx + _grid_d]
-					cnt += 1
-				if j > 0 and hit[idx - 1] != 0:
+				if i > 0 and hit[idx - 1] != 0:
 					sum += _heights[idx - 1]
 					cnt += 1
-				if j < _grid_d - 1 and hit[idx + 1] != 0:
+				if i < _grid_w - 1 and hit[idx + 1] != 0:
 					sum += _heights[idx + 1]
+					cnt += 1
+				if j > 0 and hit[idx - _grid_w] != 0:
+					sum += _heights[idx - _grid_w]
+					cnt += 1
+				if j < _grid_d - 1 and hit[idx + _grid_w] != 0:
+					sum += _heights[idx + _grid_w]
 					cnt += 1
 				if cnt > 0:
 					_heights[idx] = sum / float(cnt)
