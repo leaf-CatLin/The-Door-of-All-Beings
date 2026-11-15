@@ -7,8 +7,10 @@ extends RefCounted
 
 ## project.godot 里登记的版本键。
 const VERSION_SETTING := "application/config/version"
-## 配置缺失时的兜底版本。
-const FALLBACK_VERSION := "0.1.0"
+## 配置缺失时的兜底版本。**跟着 project.godot 一起升**：
+## 服务端把 client_version < 0.2.0（或空）当旧客户端，按旧坐标基准处理（protocol.md §11.1），
+## 兜底值留在 0.1.0 就等于让客户端凭空退回旧语义。
+const FALLBACK_VERSION := "0.2.0"
 
 ## 请求头字段名（服务端可任选其一读取）。
 const HEADER_VERSION := "X-Client-Version"

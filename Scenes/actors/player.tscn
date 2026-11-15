@@ -1,6 +1,7 @@
-[gd_scene load_steps=6 format=3]
+[gd_scene load_steps=7 format=3]
 
 [ext_resource type="Script" path="res://code/actors/player_rig.gd" id="1_rig"]
+[ext_resource type="Script" path="res://code/actors/body_hitbox.gd" id="2_hitbox"]
 
 [sub_resource type="Animation" id="Animation_idle"]
 resource_name = "idle"
@@ -486,3 +487,9 @@ position = Vector3(0, 0, -0.14)
 libraries = {
 &"": SubResource("AnimationLibrary_rig")
 }
+
+[node name="BodyHitbox" type="Node3D" parent="."]
+visible = false
+position = Vector3(0, 1.65, 0)
+script = ExtResource("2_hitbox")
+faint = true

@@ -2,8 +2,11 @@ extends Node3D
 ## 门外大厅 / 门内世界两个场景共享的编排基类。
 ##
 ## 拆场景后，world.gd 里那些「与在哪个世界无关」的逻辑都归拢到这里：
-## 输入兜底、触屏控制层、鼠标捕获、掉落保护、复位、调试面板刷新、联机层启动。
+## 输入兜底、触屏控制层、鼠标捕获、掉落保护、复位、调试面板刷新、联机层启动、战斗反馈。
 ## 子类（lobby.gd / inner_main.gd）只负责各自的节点引用与入口逻辑。
+##
+## 坐标基准（v1.4 / §11.1）：本类只用**脚底**坐标（掉落保护 FALL_LIMIT / 复位落点），
+## 头部基准的换算全在 player_fp 与 net_sync 里，别在这里加减 1.65。
 ##
 ## 约定：两个场景里玩家节点都叫 $Player、HUD 都叫 $HUD（hud.tscn 的实例）、
 ## 本界落点节点都叫 $Spawn，基类据此取用，子类 _ready 里赋值。
@@ -16,7 +19,7 @@ const TELEPORT_COOLDOWN := 1.2
 ## 掉到这个高度以下就送回本界落点。
 const FALL_LIMIT := -40.0
 
-const HINT_TEXT := "WASD 移动   ·   Shift 疾行   ·   空格 跳跃   ·   左键 攻击   ·   E 复活濒死者   ·   走近光柱进入门内世界（单向）   ·   Esc 释放鼠标   ·   R 复位   ·   F3 调试面板   ·   H 关闭本说明"
+const HINT_TEXT := "WASD 移动   ·   Shift 疾行   ·   空格 跳跃   ·   左键 攻击   ·   E 复活濒死者   ·   走近光柱进入门内世界（单向）   ·   Esc 释放鼠标   ·   R 复位   ·   F3 调试面板   ·   F4 碰撞箱   ·   H 关闭本说明"
 ## 触屏平台的提示文案（与键鼠不同源，没有 Esc / F3 / H 这些键盘操作）。
 const HINT_TEXT_TOUCH := "左侧拖动移动（推到底疾行）　·　右侧拖动转向　·　右下跳跃　·   轻点屏幕 攻击　·　走近光柱入门（单向）"
 
@@ -31,6 +34,7 @@ const FALLBACK_ACTIONS := {
 	"reset_player": [KEY_R],
 	"toggle_debug": [KEY_F3],
 	"toggle_help": [KEY_H],
+	"toggle_hitbox": [KEY_F4],
 }
 
 ## 故意不写类型标注：player_fp.gd / hud.gd 上是自定义方法，
@@ -71,6 +75,7 @@ func _process(delta: float) -> void:
 
 
 ## 把服务端权威的血量 / 灵力 / 等级 / 生死倒计时刷到 HUD。
+## v1.4 §12：顺带把自身红名标记刷到 HUD 的徽标上（state 响应的 `red`）。
 func _refresh_life_hud() -> void:
 	if _net_sync == null or _hud == null or not _hud.has_method("set_life"):
 		return
@@ -86,6 +91,15 @@ func _refresh_life_hud() -> void:
 		int(st.get("kills", 0)), int(st.get("deaths", 0)),
 		float(st.get("dying_remaining", 0.0)), float(st.get("spectator_remaining", 0.0))
 	)
+	if _hud.has_method("set_red"):
+		_hud.call("set_red", bool(st.get("red", false)))
+
+
+## 战斗反馈（net_sync 的 combat_message）：命中给「部位 × 倍率 伤害」，未命中给原因。
+## 只是屏幕下方一条短提示，不参与任何结算（判定全在服务端，见 protocol.md §11.3）。
+func _on_combat_message(text: String, good: bool) -> void:
+	if _hud != null and _hud.has_method("show_toast"):
+		_hud.call("show_toast", text, good)
 
 
 func _unhandled_input(event: InputEvent) -> void:
@@ -169,6 +183,9 @@ func _setup_net_sync() -> void:
 	_net_sync = script.new()
 	_net_sync.name = "NetSync"
 	add_child(_net_sync)
+	# 战斗反馈（命中部位 / 伤害 / 未命中原因）从联机层一路弹到 HUD 下方的一条短提示。
+	if _net_sync.has_signal("combat_message"):
+		_net_sync.connect("combat_message", _on_combat_message)
 	_net_sync.setup(_player, self)
 
 

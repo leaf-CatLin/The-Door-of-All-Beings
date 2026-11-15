@@ -1,6 +1,7 @@
 [gd_scene format=3]
 
 [ext_resource type="Script" path="res://code/outer/player_fp.gd" id="1_player"]
+[ext_resource type="Script" path="res://code/actors/body_hitbox.gd" id="2_hitbox"]
 
 [sub_resource type="CapsuleShape3D" id="CapsuleShape3D_body"]
 radius = 0.4
@@ -23,3 +24,8 @@ position = Vector3(0, 1.65, 0)
 fov = 76.0
 near = 0.05
 far = 1500.0
+
+[node name="BodyHitbox" type="Node3D" parent="."]
+visible = false
+position = Vector3(0, 1.65, 0)
+script = ExtResource("2_hitbox")

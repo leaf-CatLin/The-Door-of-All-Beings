@@ -1,13 +1,22 @@
 extends Node
 ## 业务层：把协议动作包成 GDScript 方法，并维护「本机设备 / 当前账号」状态。
 ##
-## 协议 v1.3（规范见 server-socket/protocol.md 与 flows.md）：
+## 协议 v1.4（规范见 server-socket/protocol.md 与 flows.md；报文格式沿用 v1.3）：
 ##   * 一条 TCP 长连接，服务端**不再主动推送**：世界/在线数据由 net_sync 按自选频率拉取；
 ##   * 设备标识由**服务端签发**（客户端不持密钥），拿到后原样存在本地；
 ##   * user_id 由**服务端生成**，注册提交 `<user_name>&<race>&<player_id>`；
 ##   * player_id 是**本机生成的 UUID**，服务端另存一份做本地标识；
 ##   * 会话 Token 随首个 hello 响应下发，本层采纳后交给 TcpClient 自动携带；
 ##   * Token 失效（SESSION_TOKEN_EXPIRED）由 _call 统一重登重试。
+##
+## v1.4 新增（§11 / §12 冻结契约，客户端这一半）：
+##   * **坐标基准 = 头部**：login 回写的 pos_*、peers 每行的 pos_*、state 上报都是头部中心，
+##     脚底 = 头 − HEAD_OFFSET_Y(1.65m)。本层只负责把坐标原样交给 net_sync，
+##     换算在 player_fp.teleport_head_to() / head_world_position() 里做。
+##   * hello 响应新增 `coord_base` / `hitboxes` / `attack_cone_deg`，本层存下并对表告警。
+##   * `attack` 响应新增 `part` / `multiplier` / `damage` / `killer_red` / `victim_red`，
+##     由 attack() 解析成 UI 能直接用的字段（含一句中文提示）。
+##   * `state` 响应新增 `red`；peers 每行新增 `red` / `coord_base`（红名表现见 §12）。
 
 const TcpClient = preload("res://code/net/tcp_client.gd")
 const NetConfig = preload("res://code/net/net_config.gd")
@@ -15,6 +24,12 @@ const AccountStore = preload("res://code/StartCreen/account_store.gd")
 
 ## HTTP 发现请求超时（秒）。
 const DISCOVER_TIMEOUT := 6.0
+
+## 坐标基准（§11.1）：协议里所有位置字段都是**头部中心**。
+const COORD_BASE_HEAD := "head"
+## 头部中心相对脚底的高度（m），§11.1 契约值。只在提示 / 校验里用，
+## 真正的换算在 player_fp.gd 与 net_sync.gd（远端代理）里做。
+const HEAD_OFFSET_Y := 1.65
 
 ## 登录状态变化。
 ## v1.3 起服务端**不再主动推送**：世界快照与玩家上下线全部由 net_sync 主动拉取，
@@ -46,8 +61,20 @@ var file_hash := ""
 var state_rev := 0
 
 ## 服务端权威自身状态（state 响应）：hp / hp_max / spirit / level / kills / deaths /
-## dying / dying_remaining / spectating / spectator_remaining。HUD 与濒死/旁观逻辑都读这里。
+## dying / dying_remaining / spectating / spectator_remaining / pos_* / yaw / red / coord_base。
+## v1.4 §12：`red` 是本机红名标记（HUD 徽标读它）。
+## HUD 与濒死/旁观逻辑都读这里。
 var self_state: Dictionary = {}
+
+## hello 回的下发口径（§11.1）：坐标基准 / 是否启用 11 部位命中 / 攻击扇形角。
+## 客户端本地也按 head + 11 盒实现，这里存下来用于对表与告警（不是开关）。
+var coord_base := ""
+var hitboxes_enabled := false
+var attack_cone_deg := 60.0
+
+## 最近一次 `attack` 的解析结果（结构见 parse_attack()）。
+## HUD / net_sync 不方便拿返回值时读它。
+var last_attack: Dictionary = {}
 
 ## 服务端下发的可用种族（races 动作），每项 {key, name, dev_only}。
 var races: Array = []
@@ -131,6 +158,14 @@ func connect_and_hello() -> bool:
 	protocol_version = str(data.get("protocol_version", ""))
 	push_hz = float(data.get("push_hz", 0))
 	user_name_max_len = int(data.get("user_name_max_len", user_name_max_len))
+	# v1.4 §11.1：服务端声明自己的坐标基准与命中能力，客户端口径必须一致（否则整体偏 1.65m）
+	coord_base = str(data.get("coord_base", "")).strip_edges()
+	hitboxes_enabled = bool(data.get("hitboxes", false))
+	attack_cone_deg = float(data.get("attack_cone_deg", attack_cone_deg))
+	if coord_base != "" and coord_base != COORD_BASE_HEAD:
+		push_warning("服务端坐标基准是 %s，客户端按 %s 上报，位置会整体偏移 %.2f 米" % [
+			coord_base, COORD_BASE_HEAD, HEAD_OFFSET_Y,
+		])
 	# v1.3：会话 Token 随首个 hello 响应下发，存下后后续请求自动携带
 	_adopt_session_token(data)
 	return true
@@ -322,8 +357,9 @@ func _remember_player(data: Dictionary) -> void:
 		race = str(data.get("race", "")).strip_edges()
 
 
-## 从 login 响应里读回自身存档坐标（服务端 v1.3 已回写 pos_x/y/z + yaw）。
+## 从 login 响应里读回自身存档坐标（服务端 v1.4 §11.1：`pos_*` 是**头部中心**）。
 ## 旧服务端不带这些字段时 has_spawn=false，客户端保持场景默认出生点。
+## 换算（脚底 = 头 − 1.65m）由 net_sync → player_fp.teleport_head_to() 负责，本层原样保留。
 func _apply_spawn(data: Dictionary) -> void:
 	if not data.has("pos_x"):
 		has_spawn = false
@@ -376,6 +412,7 @@ func login_with_saved_account() -> bool:
 # ---------------------------------------------------------------- 世界
 
 ## 上报自身状态。payload：`<x>&<y>&<z>&<yaw>[&hp][&state][&stamina][&mana]`。
+## **`x/y/z` 是头部中心**（§11.1；脚底 = 头 − 1.65m），取 player_fp.head_world_position()。
 ## 后四段都是可选的；本方法总是带满，方便服务端落库三围。
 ## （v1.3 起 net_sync 走 call_batch，真正在用的是下面的 state_payload() + apply_state_response()）
 func send_state(
@@ -392,6 +429,7 @@ func send_state(
 
 
 ## 拼 `state` 动作的 payload（静态：批量请求也要用，不能依赖实例）。
+## `pos` 必须是**头部世界坐标**（§11.1），不要传脚底，否则服务端整体低 1.65 米。
 ## 三围与动作词都由调用方决定，本函数只负责格式（保留两位 / 一位小数）。
 static func state_payload(
 	pos: Vector3,
@@ -429,6 +467,9 @@ func apply_state_response(res: Dictionary) -> void:
 		"pos_y": float(data.get("pos_y", 0.0)),
 		"pos_z": float(data.get("pos_z", 0.0)),
 		"yaw": float(data.get("yaw", 0.0)),
+		# v1.4 §11.1 / §12：pos_* 是头部坐标；red 是本机红名（HUD 徽标读它）
+		"red": bool(data.get("red", false)),
+		"coord_base": str(data.get("coord_base", "")),
 	}
 
 
@@ -443,9 +484,132 @@ func fetch_races() -> Dictionary:
 	return res
 
 
-## 近战攻击（服务端判定射程 / 冷却 / 伤害）。成功时 data 里有目标血量与濒死状态。
+## 近战攻击（服务端判定射程 / 冷却 / 朝向 / 部位，见 protocol.md §11.3 / §11.4）。
+## 返回值仍是统一响应结构，另外把解析结果挂两处：
+##   * `res["combat"]`：本次的解析字段（调用方拿到返回值就能直接用）；
+##   * `last_attack`：同上（给拿不到返回值的调用方）。
+## 解析字段：ok / code / text（一句中文提示）/ target / part / part_name / multiplier /
+## damage / hp / hp_max / dying / dying_remaining / distance / killer_red / victim_red。
 func attack(target_user_id: String) -> Dictionary:
-	return await _call("attack", target_user_id.strip_edges())
+	var res: Dictionary = await _call("attack", target_user_id.strip_edges())
+	var info := parse_attack(res)
+	last_attack = info
+	res["combat"] = info
+	return res
+
+
+## 把 `attack` 响应解成 UI 能直接用的字段（纯解析、无副作用，方便复用 / 对表）。
+## 成功帧按 §11.4 取 part / multiplier / damage / hp / dying / killer_red；
+## 失败帧按 §11.3 的专用码（MISS / NOT_FACING / OUT_OF_RANGE）给中文原因，
+## 未升级的服务端只会回 BAD_PAYLOAD + 中文 message，就退回 message。
+func parse_attack(res: Dictionary) -> Dictionary:
+	var info := {
+		"ok": bool(res.get("ok", false)),
+		"code": str(res.get("code", "")),
+		"target": "",
+		"part": "",
+		"part_name": "",
+		"multiplier": 1.0,
+		"damage": 0.0,
+		"hp": 0.0,
+		"hp_max": 0.0,
+		"dying": false,
+		"dying_remaining": 0.0,
+		"distance": 0.0,
+		"killer_red": false,
+		"victim_red": false,
+		"text": "",
+	}
+	if not bool(info["ok"]):
+		info["text"] = _explain_attack(res)
+		return info
+	var data: Dictionary = res.get("data", {})
+	info["target"] = str(data.get("target", "")).strip_edges()
+	var part := str(data.get("part", "")).strip_edges()
+	info["part"] = part
+	info["part_name"] = part_label(part)
+	info["multiplier"] = float(data.get("multiplier", 1.0))
+	info["damage"] = float(data.get("damage", 0.0))
+	info["hp"] = float(data.get("hp", 0.0))
+	info["hp_max"] = float(data.get("hp_max", 0.0))
+	info["dying"] = bool(data.get("dying", false))
+	info["dying_remaining"] = float(data.get("dying_remaining", 0.0))
+	info["distance"] = float(data.get("distance", 0.0))
+	info["killer_red"] = bool(data.get("killer_red", false))
+	info["victim_red"] = bool(data.get("victim_red", false))
+	info["text"] = _format_hit_text(info)
+	return info
+
+
+## 命中提示：「命中头部 ×2.0 50」（倍率 × 基础伤害 25，见 §11.2）。
+func _format_hit_text(info: Dictionary) -> String:
+	var part_name := str(info.get("part_name", ""))
+	if part_name == "":
+		# 服务端给了未知部位（契约里不会有）：至少把 key 原样显示出来，方便对表
+		part_name = str(info.get("part", ""))
+	if part_name == "":
+		part_name = "目标"
+	var text := "命中%s ×%.1f %s" % [
+		part_name,
+		float(info.get("multiplier", 1.0)),
+		_format_damage(float(info.get("damage", 0.0))),
+	]
+	if bool(info.get("dying", false)):
+		var remaining := float(info.get("dying_remaining", 0.0))
+		text += " · 目标濒死" if remaining <= 0.0 else " · 目标濒死（剩余 %.1f 秒）" % remaining
+	return text
+
+
+## 伤害去掉没意义的小数：50.0 → 50，37.5 → 37.5（服务端已经把结果取整到 0.1）。
+static func _format_damage(value: float) -> String:
+	if absf(value - roundf(value)) < 0.05:
+		return "%d" % int(roundf(value))
+	return "%.1f" % value
+
+
+## 攻击失败的一句中文原因（§11.3 的服务端权威判定）。
+func _explain_attack(res: Dictionary) -> String:
+	var code := str(res.get("code", ""))
+	match code:
+		"MISS":
+			return "没打中：射程内擦空了"
+		"NOT_FACING":
+			return "没打中：要先正对目标（攻击扇形 60°）"
+		"OUT_OF_RANGE":
+			return "没打中：目标超出 3 米射程"
+	var message := str(res.get("message", "")).strip_edges()
+	if message != "":
+		return message
+	return "攻击失败"
+
+
+## 部位 key → 中文名。与 §11.2 的 11 个 part 一一对应（两侧固定 `_l` / `_r`）。
+static func part_label(part: String) -> String:
+	match part:
+		"head":
+			return "头部"
+		"neck":
+			return "颈部"
+		"torso":
+			return "躯干"
+		"upper_arm_l":
+			return "左上臂"
+		"upper_arm_r":
+			return "右上臂"
+		"forearm_l":
+			return "左小臂"
+		"forearm_r":
+			return "右小臂"
+		"thigh_l":
+			return "左大腿"
+		"thigh_r":
+			return "右大腿"
+		"shin_l":
+			return "左小腿"
+		"shin_r":
+			return "右小腿"
+	return ""
+
 
 
 ## 复活类治疗：把濒死窗口里的队友拉起来。

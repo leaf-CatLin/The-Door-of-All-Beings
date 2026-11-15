@@ -33,6 +33,9 @@ extends Node3D
 @export var joint_color: Color = Color(1, 0.72, 0.32, 1)
 @export var joint_radius: float = 0.024
 @export var draw_joints: bool = true
+## 红名（protocol.md §12）时线框 / 关节 / 头环统一换成的颜色。
+## 服务端对红名不加任何限制，这里纯粹是「让别的玩家看得出来」。
+@export var red_name_color: Color = Color(1, 0.3, 0.28, 1)
 ## 用线框球代替关节小球的骨骼名（默认是头）。
 @export var head_bone: StringName = &"Head"
 @export var head_radius: float = 0.095
@@ -57,6 +60,8 @@ var _segments: Array = []
 var _head: Node3D
 var _anim: AnimationPlayer
 var _current_motion: StringName = &""
+## 是否红名（§12）。true 时线框 / 关节 / 头环统一染红。
+var _red: bool = false
 
 
 func _ready() -> void:
@@ -102,6 +107,27 @@ func play_motion(motion: StringName, blend_sec: float = 0.2) -> bool:
 
 func current_motion() -> StringName:
 	return _current_motion
+
+
+## 红名（protocol.md §12）：把线框 / 关节 / 头环整体染红，解除时还原。
+## 幂等：同一状态重复调用不重建材质。
+func set_red(value: bool) -> void:
+	if _red == value:
+		return
+	_red = value
+	_apply_colors()
+
+
+func is_red() -> bool:
+	return _red
+
+
+## 按当前红名状态刷材质颜色（建材质后与 set_red 共用同一条路径）。
+func _apply_colors() -> void:
+	if _line_material == null or _joint_material == null:
+		return
+	_line_material.albedo_color = red_name_color if _red else line_color
+	_joint_material.albedo_color = red_name_color if _red else joint_color
 
 
 ## 按名字取骨骼节点（找不到返回 null），方便外部单独驱动某根骨头。
@@ -159,6 +185,8 @@ func _build_materials() -> void:
 	_joint_mesh.radial_segments = 10
 	_joint_mesh.rings = 6
 	_joint_mesh.material = _joint_material
+	# 颜色统一走 _apply_colors：红名 / 普通两套色只在这里落地
+	_apply_colors()
 
 
 ## 收集骨骼与「父 → 子」连线对。

@@ -6,6 +6,11 @@ extends CanvasLayer
 ##   F3 —— 显示 / 隐藏左上角调试面板（帧率、网络延迟、速度、坐标、朝向）
 ##   H  —— 显示 / 隐藏顶部按键说明
 ##
+## 运行时构建的两块信息（v1.4）：
+##   生命面板 —— 生命 / 灵力 / 等级 / 击杀 / 死亡；
+##     §12 红名时面板里多一行「红名」徽标（state 响应的 red，由 world_base 每 0.1s 喂进来）；
+##   战斗提示 —— 屏幕下方一条短提示（命中部位 × 倍率 伤害 / 未命中原因），1.8 秒后淡出。
+##
 ## 这层上有两块白：
 ##   Flash —— 传统的整体白闪（现在是按 R 复位时闪一下）；
 ##   Wipe  —— 穿界过场：用 white_wipe.gdshader 让白色从画面中心向四周铺开。
@@ -18,6 +23,13 @@ const COMPASS_NAMES := ["北", "东北", "东", "东南", "南", "西南", "西"
 const COLOR_NORMAL := Color(0.76, 0.86, 0.96, 0.72)
 const COLOR_WARN := Color(1.0, 0.84, 0.42, 0.9)
 const COLOR_BAD := Color(1.0, 0.46, 0.42, 0.95)
+## 红名（§12）专用色：比 COLOR_BAD 更饱和，和「濒死」区分开。
+const COLOR_RED_NAME := Color(1.0, 0.33, 0.3, 1.0)
+
+## 战斗提示默认停留时长（秒），之后淡出。
+const TOAST_HOLD := 1.8
+## 淡出时长（秒）。
+const TOAST_FADE := 0.35
 
 @onready var _flash: ColorRect = $Flash
 @onready var _wipe: ColorRect = $Wipe
@@ -41,8 +53,13 @@ var _life_panel: PanelContainer
 var _hp_label: Label
 var _level_label: Label
 var _spirit_label: Label
+## 红名徽标（§12）：只有 state.red 为真时才露面。
+var _red_label: Label
 ## 濒死 / 旁观的中央提示（大字）。
 var _death_label: Label
+## 战斗提示（命中 / 未命中）的一条短提示。
+var _toast_label: Label
+var _toast_tween: Tween
 
 
 func _ready() -> void:
@@ -83,9 +100,13 @@ func _build_life_ui() -> void:
 	_hp_label = _make_label(20, COLOR_NORMAL)
 	_level_label = _make_label(16, COLOR_NORMAL)
 	_spirit_label = _make_label(16, Color(0.72, 0.88, 1.0, 0.85))
+	_red_label = _make_label(16, COLOR_RED_NAME)
+	_red_label.name = "RedName"
+	_red_label.visible = false
 	box.add_child(_hp_label)
 	box.add_child(_level_label)
 	box.add_child(_spirit_label)
+	box.add_child(_red_label)
 
 	_death_label = _make_label(30, COLOR_BAD)
 	_death_label.name = "DeathLabel"
@@ -99,6 +120,22 @@ func _build_life_ui() -> void:
 	_death_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
 	_death_label.visible = false
 	_life_root.add_child(_death_label)
+
+	# 战斗提示：屏幕下方一条短提示，命中 / 未命中都往这里丢（不抢鼠标）。
+	_toast_label = _make_label(20, COLOR_NORMAL)
+	_toast_label.name = "CombatToast"
+	_toast_label.horizontal_alignment = HORIZONTAL_ALIGNMENT_CENTER
+	_toast_label.anchor_left = 0.5
+	_toast_label.anchor_right = 0.5
+	_toast_label.anchor_top = 1.0
+	_toast_label.anchor_bottom = 1.0
+	_toast_label.offset_left = -420.0
+	_toast_label.offset_right = 420.0
+	_toast_label.offset_top = -150.0
+	_toast_label.offset_bottom = -110.0
+	_toast_label.autowrap_mode = TextServer.AUTOWRAP_WORD_SMART
+	_toast_label.visible = false
+	_life_root.add_child(_toast_label)
 
 
 func _make_label(size: int, color: Color) -> Label:
@@ -161,6 +198,43 @@ func set_life(
 func _format_seconds(total: float) -> String:
 	var seconds := int(ceil(maxf(total, 0.0)))
 	return "%02d:%02d" % [seconds / 60, seconds % 60]
+
+
+## 自身红名徽标（§12，state 响应的 `red`）。world_base 每 0.1 秒喂一次，幂等。
+## 红名只是服务端给的标记：客户端负责把它显示出来，规则本身（击杀触发 / 死亡解除）全在服务端。
+func set_red(value: bool) -> void:
+	if _red_label == null:
+		return
+	_red_label.visible = value
+	_red_label.text = "红名 · 可被无限制攻击"
+	if value and _life_panel != null:
+		# 红名可能先于生命数据到达（刚登录那几帧）：别让徽标藏在隐藏的面板里
+		_life_panel.visible = true
+
+
+## 弹一条战斗短提示（命中 / 未命中 / 复活）。good=false 用告警色，其余用正常色。
+## 同一条提示会被后来的覆盖（不排队），连点攻击时不会堆一屏字。
+func show_toast(text: String, good: bool = true, duration: float = TOAST_HOLD) -> void:
+	if _toast_label == null:
+		return
+	var body := text.strip_edges()
+	if body == "":
+		return
+	_toast_label.text = body
+	_toast_label.add_theme_color_override("font_color", COLOR_NORMAL if good else COLOR_WARN)
+	_toast_label.modulate = Color(1.0, 1.0, 1.0, 1.0)
+	_toast_label.visible = true
+	if _toast_tween != null and _toast_tween.is_valid():
+		_toast_tween.kill()
+	_toast_tween = create_tween()
+	_toast_tween.tween_interval(maxf(duration, 0.2))
+	_toast_tween.tween_property(_toast_label, "modulate:a", 0.0, TOAST_FADE)
+	_toast_tween.tween_callback(_hide_toast)
+
+
+func _hide_toast() -> void:
+	if _toast_label != null:
+		_toast_label.visible = false
 
 
 func _unhandled_input(event: InputEvent) -> void:

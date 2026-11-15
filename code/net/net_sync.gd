@@ -10,6 +10,17 @@ extends Node
 ##   4. 某个玩家从 peers 里消失就地拆代理（取代旧 PUSH event join/leave）。
 ##   5. 意外断线时在服务端宽限期内自动重连 + 重登（flows.md 流程 4 / 5）。
 ##
+## 坐标基准（v1.4 / §11.1，**冻结契约**）：
+##   * 协议里的每个位置字段（state 上报、login 回写、peers 每行）都是**头部中心**；
+##   * 本机：上报取 player_fp.head_world_position()，落位走 player_fp.teleport_head_to()；
+##   * 远端代理：代理根节点在脚底，所以 peers 的头部坐标要减去 HEAD_OFFSET_Y 再插值；
+##   * 掉落保护仍看脚底（world_base 读 player.global_position.y），不要跟着改。
+##
+## 红名（v1.4 / §12）与战斗反馈：
+##   * peers 行里的 `red` / `coord_base` 原样留在 _peer_rows 里；
+##     `red` 为真时把远端代理整体染红（player_rig.set_red），仅是给客户端看的标记；
+##   * 攻击结果（部位 / 倍率 / 伤害 / 未命中原因）通过 combat_message 交给 HUD 弹一条提示。
+##
 ## 设计要点：
 ##   * 全部用代码 add_child 挂进场景，lobby / inner_main 场景文件不需要（也不能轻易）改动；
 ##   * 断线 / 未登录时静默降级，单机玩完全不受影响；
@@ -19,6 +30,13 @@ extends Node
 
 const GameApi = preload("res://code/net/game_api.gd")
 const PlayerScene = preload("res://Scenes/actors/player.tscn")
+## 只为取 §11.1 的 HEAD_OFFSET_Y（11 盒与头部高度同源，避免第三份魔数）。
+const BodyHitboxScript = preload("res://code/actors/body_hitbox.gd")
+
+## 坐标基准取值（§11.1）。`feet` 只会出现在旧版客户端写下的老行上，服务端会一次性迁移。
+const COORD_BASE_HEAD := "head"
+const COORD_BASE_FEET := "feet"
+
 
 ## 上报间隔（秒）。拉取频率由客户端自定（v1.3）。可调小以提跟手度。
 const STATE_INTERVAL := 0.1
@@ -48,6 +66,8 @@ const REVIVE_RANGE := 5.0
 signal world_items_received(items: Array)
 ## 世界元信息（服务端 `world` 响应新增的 `world` 字段：id / name / seed / rev）。
 signal world_meta_received(meta: Dictionary)
+## 战斗反馈（攻击 / 复活的结果一句话）。world_base 接过来交给 HUD 弹一条短提示。
+signal combat_message(text: String, good: bool)
 
 ## 业务层实例。故意不写类型标注：GameApi 上是自定义方法，静态类型成 Node 会报找不到成员。
 var _api = null
@@ -111,12 +131,13 @@ func _bootstrap() -> void:
 
 ## 进世界首帧把本机玩家放到服务器存档的「上次退出位置」。仅初次进入调用；
 ## 断线重连不走这里（人已在地里，瞬移反而突兀）。无存档 / 旧服务端则保持场景默认点。
+## §11.1：`login` 回写的 pos_* 是**头部中心**，所以走 teleport_head_to（脚底 = 头 − 1.65m）。
 func _apply_spawn_to_player() -> void:
 	if _player == null or _api == null or not bool(_api.has_spawn):
 		return
-	if not _player.has_method("teleport_to_point"):
+	if not _player.has_method("teleport_head_to"):
 		return
-	_player.call("teleport_to_point", _api.spawn_position, float(_api.spawn_yaw))
+	_player.call("teleport_head_to", _api.spawn_position, float(_api.spawn_yaw))
 
 
 ## 静默重登（建连 + hello + device + login）。成功返回 true。
@@ -221,8 +242,9 @@ func _process(delta: float) -> void:
 
 
 ## 本机上报的 `state` payload（格式由 GameApi.state_payload 统一维护）。
+## §11.1：x/y/z 必须是**头部中心**，不是脚底 —— 服务端按头部做命中判定、落库与回写。
 func _state_payload() -> String:
-	var pos: Vector3 = _player.global_position
+	var pos := _local_head_position()
 	var yaw := 0.0
 	var speed := 0.0
 	if _player.has_method("get_yaw_degrees"):
@@ -231,6 +253,13 @@ func _state_payload() -> String:
 		speed = float(_player.call("get_horizontal_speed"))
 	var motion := MOTION_MOVING if speed > WALK_SPEED else MOTION_IDLE
 	return _api.state_payload(pos, yaw, hp, motion, stamina, mana)
+
+
+## 本机头部中心的世界坐标（§11.1）。player_fp 没提供时按「脚底 + 1.65m」兜底。
+func _local_head_position() -> Vector3:
+	if _player != null and _player.has_method("head_world_position"):
+		return _player.call("head_world_position")
+	return _player.global_position + Vector3(0.0, BodyHitboxScript.HEAD_OFFSET_Y, 0.0)
 
 
 ## 处理批量里 `state` 那一帧：只有「服务器不认我了」这一档值得动手，其余交给下一轮。
@@ -263,14 +292,15 @@ func _apply_life_state() -> void:
 	elif not spectating and _was_spectating:
 		if _player.has_method("set_spectator"):
 			_player.call("set_spectator", false)
-		# 旁观结束：服务端把复活点冻结在死亡位置，客户端飞出去的身体要拉回来
-		if _player.has_method("teleport_to_point") and st.has("pos_x"):
+		# 旁观结束：服务端把复活点冻结在死亡位置，客户端飞出去的身体要拉回来。
+		# §11.1：state 回写的 pos_* 也是头部坐标，按头部落位。
+		if _player.has_method("teleport_head_to") and st.has("pos_x"):
 			var back := Vector3(
 				float(st.get("pos_x", 0.0)),
 				float(st.get("pos_y", 0.0)),
 				float(st.get("pos_z", 0.0)),
 			)
-			_player.call("teleport_to_point", back, float(st.get("yaw", 0.0)))
+			_player.call("teleport_head_to", back, float(st.get("yaw", 0.0)))
 
 	if not _player.has_method("set_frozen"):
 		_was_spectating = spectating
@@ -301,13 +331,21 @@ func _apply_players(payload: Dictionary) -> void:
 		if uid == "" or uid == str(_api.user_id):
 			continue
 		seen[uid] = true
+		# 整行原样保留：`red`（§12 红名）/ `coord_base`（§11.1 行级坐标基准）后续都要用
 		_peer_rows[uid] = row
+		# §11.1：peers 的 pos_* 是**头部中心**；代理根节点在脚底，插值目标要减掉 HEAD_OFFSET_Y。
+		# 行级 `coord_base` 为 'feet' 的是旧客户端写下的老数据（服务端会一次性迁移），按行换算。
+		var head_pos := Vector3(
+			float(row.get("pos_x", 0.0)),
+			float(row.get("pos_y", 0.0)),
+			float(row.get("pos_z", 0.0)),
+		)
+		var feet_pos := head_pos
+		if str(row.get("coord_base", COORD_BASE_HEAD)) != COORD_BASE_FEET:
+			feet_pos = head_pos - Vector3(0.0, BodyHitboxScript.HEAD_OFFSET_Y, 0.0)
 		_targets[uid] = {
-			"pos": Vector3(
-				float(row.get("pos_x", 0.0)),
-				float(row.get("pos_y", 0.0)),
-				float(row.get("pos_z", 0.0)),
-			),
+			"head": head_pos,
+			"pos": feet_pos,
 			"yaw": float(row.get("yaw", 0.0)),
 		}
 		var avatar = _avatars.get(uid, null)
@@ -315,6 +353,7 @@ func _apply_players(payload: Dictionary) -> void:
 			avatar = _spawn_avatar(uid)
 		if avatar != null:
 			_set_motion(avatar, str(row.get("state", "idle")))
+			_set_avatar_red(avatar, bool(row.get("red", false)))
 	# 这一轮没出现的就地拆除（已下线）
 	for uid in _avatars.keys():
 		if not seen.has(uid):
@@ -324,6 +363,8 @@ func _apply_players(payload: Dictionary) -> void:
 			_peer_rows.erase(uid)
 
 
+## 生成一个远端代理。代理根节点在**脚底**（player.tscn 的骨架原点），
+## 所以 _targets 里存的是「头部 − 1.65m」的脚底目标点，盒子（BodyHitbox）挂在根下 +1.65m。
 func _spawn_avatar(uid: String) -> Node3D:
 	if _root == null:
 		return null
@@ -367,6 +408,16 @@ func _set_motion(avatar: Node3D, state: String) -> void:
 	if avatar.has_method("current_motion") and str(avatar.call("current_motion")) == motion:
 		return
 	avatar.call("play_motion", motion)
+
+
+## 红名（§12）：远端代理整体染红（player_rig 把线框 / 关节 / 头环的材质换成红名色）。
+## 服务端对红名**不加任何限制**，这里纯粹是「让别的玩家看得出来」。
+func _set_avatar_red(avatar: Node3D, red: bool) -> void:
+	if not avatar.has_method("set_red"):
+		return
+	if avatar.has_method("is_red") and bool(avatar.call("is_red")) == red:
+		return
+	avatar.call("set_red", red)
 
 
 func _tick_avatars(delta: float) -> void:
@@ -427,30 +478,60 @@ func set_stats(new_hp: float, new_stamina: float, new_mana: float) -> void:
 
 
 ## 服务端权威自我状态（HUD 用）；未登录 / 尚无响应时为空字典。
+## 含 hp / hp_max / spirit / level / kills / deaths / dying / dying_remaining /
+## spectating / spectator_remaining / pos_* / yaw / red / coord_base。
 func self_state() -> Dictionary:
 	return {} if _api == null else _api.self_state
 
 
-## 攻击最近的玩家（客户端只负责选目标，射程 / 冷却 / 伤害由服务端判定）。
+## 本机是否红名（§12，取 state 响应的 `red`）。HUD 徽标用。
+func self_red() -> bool:
+	return bool(self_state().get("red", false))
+
+
+## 某个在线玩家的原始 peers 行（含 red / coord_base / dying 等），没有返回空字典。
+func peer_row(user_id: String) -> Dictionary:
+	return _peer_rows.get(user_id, {})
+
+
+## 攻击最近的玩家（客户端只负责选目标，射程 / 朝向 / 部位 / 伤害由服务端判定）。
+## 结果通过 combat_message 交给 HUD 弹一条短提示（命中部位 × 倍率 伤害 / 未命中原因）。
 func attack_nearest() -> void:
+	if _api == null or not bool(_api.authenticated) or _player == null:
+		return
 	var target := _nearest_peer(ATTACK_RANGE, false)
 	if target == "":
+		combat_message.emit("附近 3 米内没有可攻击的目标", false)
 		return
-	_api.attack(target)
+	var res: Dictionary = await _api.attack(target)
+	var info: Dictionary = res.get("combat", _api.last_attack)
+	combat_message.emit(str(info.get("text", "")), bool(info.get("ok", false)))
 
 
-## 复活最近的濒死玩家（5 秒窗口内、治疗距离内）。
+## 复活最近的濒死玩家（5 秒窗口内、治疗距离内）。结果同样弹一条提示。
 func revive_nearest() -> void:
+	if _api == null or not bool(_api.authenticated) or _player == null:
+		return
 	var target := _nearest_peer(REVIVE_RANGE, true)
 	if target == "":
+		combat_message.emit("附近 5 米内没有濒死玩家", false)
 		return
-	_api.revive(target)
+	var res: Dictionary = await _api.revive(target)
+	if not bool(res.get("ok", false)):
+		combat_message.emit(_api.explain(res, "复活失败"), false)
+		return
+	var data: Dictionary = res.get("data", {})
+	combat_message.emit("复活成功（目标生命 %.0f / %.0f）" % [
+		float(data.get("hp", 0.0)), float(data.get("hp_max", 0.0)),
+	], true)
 
 
 ## 选出距离本机最近、且满足条件的目标 user_id；没有返回空串。
+## §11.1：服务端判命中是「攻击者头 → 目标头」，所以选目标也用头部基准。
 func _nearest_peer(max_range: float, need_dying: bool) -> String:
 	if _api == null or not bool(_api.authenticated) or _player == null:
 		return ""
+	var origin := _local_head_position()
 	var best_uid := ""
 	var best_dist := max_range
 	for uid in _peer_rows.keys():
@@ -462,7 +543,7 @@ func _nearest_peer(max_range: float, need_dying: bool) -> String:
 		var target: Dictionary = _targets.get(uid, {})
 		if target.is_empty():
 			continue
-		var dist := _player.global_position.distance_to(target["pos"])
+		var dist := origin.distance_to(target.get("head", target["pos"]))
 		if dist <= best_dist:
 			best_dist = dist
 			best_uid = str(uid)

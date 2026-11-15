@@ -1,25 +1,31 @@
 extends Node
-## 众生之门 TCP 协议客户端（协议 v1.3，规范见 server-socket/protocol.md 与 flows.md）。
+## 众生之门 TCP 协议客户端（协议 v1.4，规范见 server-socket/protocol.md 与 flows.md）。
 ##
 ## 职责边界：只负责「把一条请求发出去、把对应的响应拿回来」，不懂业务。
 ## 业务封装在 game_api.gd；地址在 net_config.gd。
 ##
 ## 设计要点：
 ##   * **长连接**：一个 TcpClient 只用一条 TCP。
-##   * **拉取式（v1.3）**：服务端不再主动推任何帧，世界/在线数据由上层按自选频率拉取。
+##   * **拉取式（v1.3 起）**：服务端不再主动推任何帧，世界/在线数据由上层按自选频率拉取。
 ##   * **串行化**：同一时刻只允许一条请求在路上（服务端回帧不带请求 id，
 ##     并发就会错配），后来的 call 会排队。批量请求走 request_batch，一次收多帧。
 ##   * **不阻塞主线程**：全部用 await process_frame 轮询，不开线程。
 ##   * **每次请求都带客户端版本**（协议头第 5 字段），符合项目约定。
-##   * **联合哈希（v1.3）**：请求尾哈希覆盖「请求头 + 正文两行」，改头部即失效。
-##   * **会话 Token（v1.3）**：不再建连推送，改为从首个 hello 响应里取（adopt_token），
+##     服务端靠第 5 段判客户端版本（< 0.2.0 按旧坐标基准处理，见 §11.1），
+##     所以 project.godot 的 application/config/version 与这里都要跟着升级。
+##   * **联合哈希（v1.3 起）**：请求尾哈希覆盖「请求头 + 正文两行」，改头部即失效。
+##   * **会话 Token（v1.3 起）**：不再建连推送，改为从首个 hello 响应里取（adopt_token），
 ##     本类把它放进后续每条请求的第 3 行。没 token 时退回 v1.1 的 2 段写法。
+##
+## v1.4 在**报文格式上是纯版本号升级**：4 行报文、联合哈希、批量 `;;` 规则全部不变，
+## 只有 PROTOCOL_VERSION 与业务字段（头部坐标基准 / 11 部位命中 / 红名）变了。
 
 const AppInfo = preload("res://code/net/app_info.gd")
 
 ## 协议常量（必须与服务端 protocol.py 一致）。
 const MAGIC := "TheDoorOfBings"
-const PROTOCOL_VERSION := "1.3"
+## v1.4：只升版本号，报文格式 / 联合哈希 / 批量规则与 v1.3 完全一致。
+const PROTOCOL_VERSION := "1.4"
 const ENCRYPTION := "none"
 
 ## 推送 topic（v1.3 服务端不再下发，保留仅为兼容）。

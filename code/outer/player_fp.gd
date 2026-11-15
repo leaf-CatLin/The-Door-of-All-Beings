@@ -3,6 +3,17 @@ extends CharacterBody3D
 ##
 ## 约定：节点原点在脚底，胶囊碰撞体向上偏移半个身高，所以摆在 (x, 0, z) 就是站在地面上。
 ## 头节点（Head）只负责俯仰，角色本体负责左右转身。
+##
+## 坐标基准（协议 v1.4 / §11.1）：**协议里的一切位置字段都是头部中心**，
+## 脚底 = 头部 − HEAD_OFFSET_Y（1.65m）。因此：
+##   * 上行（net_sync 的 state）与落位（login / peers 的 pos_*）都走头部，
+##     入口是 head_world_position() 与 teleport_head_to()；
+##   * 场景内的落点（Spawn 节点 / 地形高度）仍是脚底语义，继续用 teleport_to / teleport_to_point；
+##   * 掉落保护 / 复位看脚底 global_position.y。
+## 头部高度与 §11.2 的 11 个盒子同源（见 code/actors/body_hitbox.gd 的 HEAD_OFFSET_Y）。
+
+## 头部中心相对脚底的高度（m）。§11.1 契约值 1.65，与服务端 HEAD_OFFSET_Y 一致，勿改。
+const HEAD_OFFSET_Y := 1.65
 
 @export_group("移动 Movement")
 @export var walk_speed: float = 3.6
@@ -153,11 +164,26 @@ func teleport_to(spawn: Node3D) -> void:
 
 
 ## 落到“某一个点”，朝向用角度（度）指定 —— 门内世界的随机落点用这个。
+## point 是**脚底**（场景内的落点语义）。服务端下发的坐标请用 teleport_head_to()。
 func teleport_to_point(point: Vector3, yaw_degrees: float) -> void:
 	velocity = Vector3.ZERO
 	global_position = point
 	rotation = Vector3(0.0, deg_to_rad(yaw_degrees), 0.0)
 	_apply_pitch(0.0)
+
+
+## 按**头部中心**落位（协议 v1.4 / §11.1）：login 回写的 pos_*、peers 每行的 pos_*、
+## state 响应里的死亡点，都是头部坐标；脚底 = 头 − HEAD_OFFSET_Y。
+func teleport_head_to(point: Vector3, yaw_degrees: float) -> void:
+	teleport_to_point(point - Vector3(0.0, HEAD_OFFSET_Y, 0.0), yaw_degrees)
+
+
+## 头部中心的世界坐标（协议 v1.4 上报用）。俯仰只转 Head 自身，不影响它的位置；
+## Head 节点缺失时按“脚底 + HEAD_OFFSET_Y”兜底，保证上报永远是头部基准。
+func head_world_position() -> Vector3:
+	if _head != null:
+		return _head.global_position
+	return global_position + Vector3(0.0, HEAD_OFFSET_Y, 0.0)
 
 
 ## 当前水平速度（m/s），给 HUD 用。
